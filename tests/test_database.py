@@ -95,3 +95,35 @@ async def test_admin_time_change_applies_to_existing_records(db):
     await db.configure(1, 100, None, "UTC", 10, 30, "", "mar1")
     value = await db.birthday(1, 2)
     assert (value["hour"], value["minute"], value["leap"]) == (10, 30, "mar1")
+
+
+async def test_new_servers_default_to_midnight(db):
+    assert ((await db.guild(1))["hour"], (await db.guild(1))["minute"]) == (0, 0)
+
+
+async def test_midnight_upgrade_updates_legacy_records_once_and_preserves_custom_times(db):
+    await db.ensure_guild(2)
+    await db.configure(1, 100, None, "UTC", 9, 0, "")
+    await db.configure(2, 200, None, "UTC", 18, 45, "")
+    await db.save(1, 10, 1, 1, "America/Denver", 9, 0, "feb28", True)
+    await db.save(2, 20, 1, 1, "Asia/Tokyo", 18, 45, "feb28", False)
+    async with db.transaction() as conn:
+        await conn.execute("PRAGMA user_version=4")
+    upgraded = Database(db.path)
+    await upgraded.open()
+    try:
+        assert (await upgraded.guild(1))["hour"] == 0
+        assert (await upgraded.birthday(1, 10))["hour"] == 0
+        assert (await upgraded.guild(2))["hour"] == 18
+        private = await upgraded.birthday(2, 20)
+        assert (private["hour"], private["minute"], private["consent"]) == (18, 45, 0)
+        await upgraded.configure(1, 100, None, "UTC", 9, 0, "")
+    finally:
+        await upgraded.close()
+    reopened = Database(db.path)
+    await reopened.open()
+    try:
+        assert (await reopened.guild(1))["hour"] == 9
+        assert (await reopened.birthday(1, 10))["hour"] == 9
+    finally:
+        await reopened.close()

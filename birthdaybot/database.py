@@ -11,7 +11,7 @@ import aiosqlite
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
  guild_id INTEGER PRIMARY KEY, channel_id INTEGER, alert_channel_id INTEGER,
- timezone TEXT NOT NULL DEFAULT 'UTC', hour INTEGER NOT NULL DEFAULT 9 CHECK(hour BETWEEN 0 AND 23),
+ timezone TEXT NOT NULL DEFAULT 'UTC', hour INTEGER NOT NULL DEFAULT 0 CHECK(hour BETWEEN 0 AND 23),
  minute INTEGER NOT NULL DEFAULT 0 CHECK(minute BETWEEN 0 AND 59),
  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), gif TEXT NOT NULL DEFAULT '',
  leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only')),
@@ -59,7 +59,7 @@ CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
 CREATE INDEX IF NOT EXISTS birthdays_public_guild_date ON birthdays(guild_id,month,day,user_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=4;
+PRAGMA user_version=5;
 """
 
 
@@ -82,7 +82,7 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3, 4):
+            if version not in (0, 1, 2, 3, 4, 5):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
@@ -101,6 +101,14 @@ class Database:
                 migration += "INSERT INTO deliveries_next SELECT * FROM deliveries; DROP TABLE deliveries; ALTER TABLE deliveries_next RENAME TO deliveries;"
             if version in (1, 2, 3):
                 migration += "ALTER TABLE guilds ADD COLUMN public_birthdays INTEGER NOT NULL DEFAULT 1 CHECK(public_birthdays IN (0,1));"
+            if version in (1, 2, 3, 4):
+                # Replace the previous 09:00 default once; preserve other configured
+                # times and allow moderators to choose 09:00 again after upgrading.
+                migration += """
+                UPDATE birthdays SET hour=0,minute=0 WHERE guild_id IN
+                  (SELECT guild_id FROM guilds WHERE hour=9 AND minute=0);
+                UPDATE guilds SET hour=0 WHERE hour=9 AND minute=0;
+                """
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
         except BaseException:
@@ -125,7 +133,10 @@ class Database:
 
     async def ensure_guild(self, guild_id):
         async with self.transaction() as conn:
-            await conn.execute("INSERT OR IGNORE INTO guilds(guild_id) VALUES (?)", (guild_id,))
+            # Older database files still have the legacy SQL column default.
+            await conn.execute(
+                "INSERT OR IGNORE INTO guilds(guild_id,hour,minute) VALUES (?,0,0)", (guild_id,)
+            )
 
     async def guild(self, guild_id):
         rows = await self.read("SELECT * FROM guilds WHERE guild_id=?", (guild_id,))

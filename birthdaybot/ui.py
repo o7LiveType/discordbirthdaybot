@@ -4,7 +4,7 @@ import time
 
 import discord
 
-from .config import gif_url
+from .config import DEFAULT_GIF, gif_url
 from .delivery import channel_issues
 from .timeutil import anniversary, clock, timezone
 
@@ -49,12 +49,16 @@ class OwnedView(discord.ui.View):
         self.queue = queue
 
     def add_item(self, item):
-        if self.queue is not None and getattr(item.callback, "__name__", "") != "defaults":
+        if self.queue is not None:
             callback = item.callback
 
             async def run(interaction):
                 # Opening a modal must be the initial response, not a deferred job.
-                if isinstance(item, discord.ui.Select) and item.values == ["custom"]:
+                if (
+                    isinstance(item, discord.ui.Select)
+                    and item.values
+                    and item.values[0] in getattr(callback, "opens_modal_values", {"custom"})
+                ):
                     return await callback(interaction)
                 return await self.queue.run(
                     interaction, lambda: callback(interaction), update=True, rate_checked=True
@@ -100,7 +104,7 @@ class FieldsModal(discord.ui.Modal):
         self.inputs = {}
         for key, label, default in fields:
             field = discord.ui.TextInput(
-                default=default, max_length=500 if key == "gif" else 80, required=key != "gif"
+                default=default, max_length=2048 if key == "gif" else 80, required=key != "gif"
             )
             self.inputs[key] = field
             self.add_item(discord.ui.Label(text=label, component=field))
@@ -378,118 +382,186 @@ class Confirm(OwnedView):
 
 
 class SettingsWizard(OwnedView):
+    SECTIONS = [
+        ("Overview", "overview"),
+        ("Birthday channel", "channel"),
+        ("Moderator alerts", "alerts"),
+        ("Announcement time", "time"),
+        ("Birthday GIF link", "gif"),
+        ("Birthday list access", "privacy"),
+        ("February 29 birthdays", "leap"),
+    ]
+
     def __init__(self, bot, owner, settings):
         super().__init__(owner, admin=True, queue=bot.queue)
-        self.bot = bot
-        self.guild_id = settings["guild_id"]
+        self.bot, self.guild_id = bot, settings["guild_id"]
         self.channel_id, self.alert_id = settings["channel_id"], settings["alert_channel_id"]
         self.zone = settings["timezone"]
         self.hour, self.minute = settings["hour"], settings["minute"]
-        self.gif = settings["gif"]
+        try:
+            self.gif = gif_url(settings["gif"]) if settings["gif"] else ""
+        except ValueError:
+            self.gif = ""
+            log.warning("invalid_saved_gif_replaced guild=%s", self.guild_id)
         self.leap = settings["leap"]
         self.public_birthdays = bool(settings["public_birthdays"])
-        for row, label, attr in [
-            (0, "Birthday announcements channel", "channel_id"),
-            (1, "Optional moderator alerts channel", "alert_id"),
-        ]:
-            select = discord.ui.ChannelSelect(
-                placeholder=label, channel_types=[discord.ChannelType.text], row=row
+        self.section = "overview"
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        menu = discord.ui.Select(
+            placeholder="Choose a setting",
+            row=0,
+            options=[
+                discord.SelectOption(label=label, value=value, default=value == self.section)
+                for label, value in self.SECTIONS
+            ],
+        )
+
+        async def navigate(interaction):
+            choice = menu.values[0]
+            if choice == "time":
+                await self.edit_time(interaction)
+                return
+            if choice == "gif":
+                await self.edit_gif(interaction)
+                return
+            self.section = choice
+            self.build()
+            await edit(interaction, content=self.content(), view=self)
+
+        navigate.opens_modal_values = {"time", "gif"}
+        menu.callback = navigate
+        self.add_item(menu)
+        if self.section in {"channel", "alerts"}:
+            channel = discord.ui.ChannelSelect(
+                placeholder="Choose a birthday channel"
+                if self.section == "channel"
+                else "Choose a moderator alerts channel",
+                channel_types=[discord.ChannelType.text],
+                row=1,
             )
+            attribute = "channel_id" if self.section == "channel" else "alert_id"
 
-            def callback_for(component, attribute):
-                async def changed(interaction):
-                    setattr(self, attribute, component.values[0].id)
-                    await edit(interaction, content=self.content(), view=self)
+            async def choose_channel(interaction):
+                setattr(self, attribute, channel.values[0].id)
+                await edit(interaction, content=self.content(), view=self)
 
-                return changed
-
-            select.callback = callback_for(select, attr)
-            self.add_item(select)
-        leap = discord.ui.Select(
-            placeholder="February 29 birthdays",
-            row=2,
-            options=[
-                discord.SelectOption(label=label, value=value, default=value == self.leap)
-                for label, value in [
-                    ("Non-leap years: celebrate February 28", "feb28"),
-                    ("Non-leap years: celebrate March 1", "mar1"),
-                    ("Only celebrate February 29 in leap years", "leap_only"),
+            channel.callback = choose_channel
+            self.add_item(channel)
+            if self.section == "alerts":
+                self.add_item(button("Turn alerts off", self.clear_alerts, row=2))
+        elif self.section in {"privacy", "leap"}:
+            options = (
+                [
+                    ("Public — everyone can browse", "public"),
+                    ("Private — moderators only", "private"),
                 ]
-            ],
-        )
+                if self.section == "privacy"
+                else [
+                    ("Celebrate February 28 in non-leap years", "feb28"),
+                    ("Celebrate March 1 in non-leap years", "mar1"),
+                    ("Celebrate only in leap years", "leap_only"),
+                ]
+            )
+            selected = (
+                ("public" if self.public_birthdays else "private")
+                if self.section == "privacy"
+                else self.leap
+            )
+            choice = discord.ui.Select(
+                placeholder="Choose birthday list access"
+                if self.section == "privacy"
+                else "Choose the February 29 rule",
+                row=1,
+                options=[
+                    discord.SelectOption(label=label, value=value, default=value == selected)
+                    for label, value in options
+                ],
+            )
+            section = self.section
 
-        async def choose_leap(interaction):
-            self.leap = leap.values[0]
-            await edit(interaction, content=self.content(), view=self)
+            async def choose_option(interaction):
+                if section == "privacy":
+                    self.public_birthdays = choice.values[0] == "public"
+                else:
+                    self.leap = choice.values[0]
+                self.build()
+                await edit(interaction, content=self.content(), view=self)
 
-        leap.callback = choose_leap
-        self.add_item(leap)
-        visibility = discord.ui.Select(
-            placeholder="Birthday list access",
-            row=3,
-            options=[
-                discord.SelectOption(
-                    label="Public — everyone can browse",
-                    value="public",
-                    default=self.public_birthdays,
-                ),
-                discord.SelectOption(
-                    label="Private — moderators only",
-                    value="private",
-                    default=not self.public_birthdays,
-                ),
-            ],
-        )
-
-        async def choose_visibility(interaction):
-            self.public_birthdays = visibility.values[0] == "public"
-            await edit(interaction, content=self.content(), view=self)
-
-        visibility.callback = choose_visibility
-        self.add_item(visibility)
-        self.add_item(button("Time / GIF", self.defaults))
-        self.add_item(button("Clear alerts", self.clear_alerts))
+            choice.callback = choose_option
+            self.add_item(choice)
+        elif self.section == "time":
+            self.add_item(button("Midnight (00:00)", self.reset_midnight, row=2))
         self.add_item(button("Save settings", self.save, style=discord.ButtonStyle.success))
+        self.add_item(button("Cancel", self.cancel))
 
     def content(self):
+        default = getattr(self.bot.config, "gif", DEFAULT_GIF)
+        default = gif_url(default) if isinstance(default, str) and default else DEFAULT_GIF
         return (
-            f"**Birthday bot setup · moderators only**\n"
-            f"Birthday channel: {f'<#{self.channel_id}>' if self.channel_id else 'NOT SET'}\n"
-            f"Alerts channel: {f'<#{self.alert_id}>' if self.alert_id else 'OFF — warnings in logs only'}\n"
-            f"Birthday list access: **{'Public' if self.public_birthdays else 'Moderators only'}** · opted-out dates stay hidden publicly\n"
+            "**Birthday bot settings**\n"
+            f"Birthday channel: {f'<#{self.channel_id}>' if self.channel_id else 'Not set'}\n"
+            f"Moderator alerts: {f'<#{self.alert_id}>' if self.alert_id else 'Off'}\n"
             f"Announcement time: **{self.hour:02}:{self.minute:02} in each member's timezone**\n"
-            f"February 29 rule: **{ {'feb28': 'February 28', 'mar1': 'March 1', 'leap_only': 'leap years only'}[self.leap] }**\n"
-            "Time and leap-day changes apply to all birthdays in this server.\n"
-            "Alerts repeat at most hourly when setup or delivery needs attention. "
-            "Choose a private moderator channel for alerts. Save applies all settings."
+            f"Birthday GIF: [Open GIF]({self.gif or default})\n"
+            f"Birthday lists: **{'Public' if self.public_birthdays else 'Moderators only'}** · opted-out dates stay hidden publicly\n"
+            f"February 29: **{ {'feb28': 'February 28', 'mar1': 'March 1', 'leap_only': 'leap years only'}[self.leap] }**\n\n"
+            "Choose a setting from the menu, then **Save settings**. **00:00 is local midnight.** "
+            "The time and leap-day rule apply to every birthday in this server."
         )
 
-    async def defaults(self, interaction):
+    async def edit_time(self, interaction):
         async def submit(submission, values):
             hour, minute = clock(values["time"])
-            gif = gif_url(values["gif"]) if values["gif"] else ""
             if self.is_finished():
                 await private(submission, "This menu expired. Run /birthday-admin setup again.")
                 return
-            self.hour, self.minute, self.gif = hour, minute, gif
+            self.hour, self.minute, self.section = hour, minute, "time"
+            self.build()
             await edit(submission, content=self.content(), view=self)
 
         await interaction.response.send_modal(
             FieldsModal(
-                "Announcement time and birthday GIF",
+                "Announcement time",
                 [
                     (
                         "time",
-                        "Time in each member's timezone (HH:MM)",
+                        "Local time (HH:MM; 00:00 = midnight)",
                         f"{self.hour:02}:{self.minute:02}",
-                    ),
-                    ("gif", "Direct KLIPY GIF URL (blank uses .env default)", self.gif),
+                    )
                 ],
                 submit,
                 self.owner,
                 admin=True,
             )
         )
+
+    async def edit_gif(self, interaction):
+        async def submit(submission, values):
+            value = gif_url(values["gif"]) if values["gif"] else ""
+            if self.is_finished():
+                await private(submission, "This menu expired. Run /birthday-admin setup again.")
+                return
+            self.gif, self.section = value, "gif"
+            self.build()
+            await edit(submission, content=self.content(), view=self)
+
+        await interaction.response.send_modal(
+            FieldsModal(
+                "Birthday GIF link",
+                [("gif", "HTTPS .gif URL (blank uses default)", self.gif)],
+                submit,
+                self.owner,
+                admin=True,
+            )
+        )
+
+    async def reset_midnight(self, interaction):
+        self.hour, self.minute, self.section = 0, 0, "time"
+        self.build()
+        await edit(interaction, content=self.content(), view=self)
 
     async def clear_alerts(self, interaction):
         self.alert_id = None
@@ -503,10 +575,11 @@ class SettingsWizard(OwnedView):
         if self.alert_id:
             issues += channel_issues(guild.get_channel(self.alert_id), guild)
         if not (self.gif or self.bot.config.gif):
-            issues.append("Choose a celebration GIF in Time / GIF first.")
+            issues.append("Choose a birthday GIF link first.")
         if issues:
             await private(interaction, "Cannot save yet:\n" + "\n".join(issues))
             return
+        self.gif = gif_url(self.gif) if self.gif else ""
         await defer(interaction)
         async with self.bot.mutation_lock:
             await self.bot.db.configure(
@@ -530,3 +603,7 @@ class SettingsWizard(OwnedView):
             self.owner,
             self.channel_id,
         )
+
+    async def cancel(self, interaction):
+        self.stop()
+        await edit(interaction, content="Cancelled. Settings were not changed.", view=None)

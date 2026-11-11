@@ -76,3 +76,24 @@ def test_next_leap_only_and_leap_century():
 def test_skipped_date_does_not_send_on_following_day():
     value = record(month=12, day=30, timezone="Pacific/Apia")
     assert due(value, datetime(2011, 12, 30, 20, tzinfo=UTC)) is None
+
+
+@pytest.mark.parametrize(
+    ("zone", "month", "utc_month", "utc_day", "utc_hour", "utc_minute"),
+    [
+        ("America/Denver", 11, 11, 10, 7, 0),
+        ("America/Denver", 7, 7, 10, 6, 0),
+        ("Asia/Tokyo", 11, 11, 9, 15, 0),
+        ("Asia/Kathmandu", 11, 11, 9, 18, 15),
+        ("Pacific/Kiritimati", 11, 11, 9, 10, 0),
+    ],
+)
+def test_local_midnight_is_due_at_the_configured_zone_boundary(
+    zone, month, utc_month, utc_day, utc_hour, utc_minute
+):
+    from datetime import timedelta
+
+    value = record(month=month, day=10, timezone=zone, hour=0, minute=0)
+    target = datetime(2026, utc_month, utc_day, utc_hour, utc_minute, tzinfo=UTC)
+    assert due(value, target - timedelta(seconds=1)) is None
+    assert due(value, target) == target

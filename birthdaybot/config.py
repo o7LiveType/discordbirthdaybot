@@ -1,7 +1,8 @@
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -9,7 +10,16 @@ DEFAULT_GIF = "https://static2.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/b5/
 
 
 def gif_url(value: str) -> str:
-    parsed = urlparse(value.strip())
+    value = value.strip()
+    error = "Use a direct HTTPS .gif URL from a supported KLIPY or GIPHY media host, without credentials, query strings or fragments."
+    if len(value) > 2048 or re.search(r"[\s\x00-\x1f\x7f-\x9f\\]", value):
+        raise ValueError(error)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        decoded = unquote(parsed.path, errors="strict")
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError(error) from exc
     allowed = {
         "static.klipy.com",
         "static2.klipy.com",
@@ -23,17 +33,25 @@ def gif_url(value: str) -> str:
     if (
         parsed.scheme != "https"
         or host not in allowed
-        or parsed.username
-        or parsed.password
-        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
         or parsed.query
         or parsed.fragment
-        or not parsed.path.lower().endswith(".gif")
+        or not decoded.lower().endswith(".gif")
+        or re.search(r"[\x00-\x1f\x7f-\x9f\\]", decoded)
+        or re.search(r"%(?![0-9a-fA-F]{2})", parsed.path)
     ):
-        raise ValueError(
-            "Use a direct HTTPS .gif URL from static.klipy.com or a supported GIF media host (see README)."
-        )
-    return value.strip()
+        raise ValueError(error)
+    # Canonical media URLs remain safe inside Discord Markdown links. In
+    # particular brackets, parentheses, backticks and angle brackets are escaped.
+    try:
+        sanitized = urlunsplit(("https", host, quote(decoded, safe="/-._~"), "", ""))
+    except UnicodeError as exc:
+        raise ValueError(error) from exc
+    if len(sanitized) > 2048:
+        raise ValueError(error)
+    return sanitized
 
 
 @dataclass(frozen=True)

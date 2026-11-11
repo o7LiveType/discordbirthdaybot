@@ -26,6 +26,14 @@ from birthdaybot.ui import BirthdayWizard, FieldsModal, OwnedView, SettingsWizar
         "https://static.klipy.com:8443/x.gif",
         "file:///tmp/x.gif",
         "https://static.klipy.com/x.mp4",
+        "https://static.klipy.com/a.gif\n@everyone/b.gif",
+        "https://static.klipy.com/%0Amessage.gif",
+        "https://static.klipy.com/%00.gif",
+        "https://static.klipy.com/%5Cevil.gif",
+        "https://static.klipy.com/bad%ZZ.gif",
+        "https://@static.klipy.com/a.gif",
+        "https://static.klipy.com:bad/a.gif",
+        "https://static.klipy.com/" + "a" * 2048 + ".gif",
     ],
 )
 def test_external_urls_rejected(url):
@@ -99,7 +107,11 @@ async def test_menus_fit_discord_limits_and_preserve_opt_out(db):
         if isinstance(component, discord.ui.Select):
             assert len(component.options) <= 25
     admin_view = SettingsWizard(MagicMock(), 10, settings)
-    assert len(admin_view.to_components()) == 5
+    assert len(admin_view.to_components()) == 2
+    assert {option.label for option in admin_view.children[0].options} >= {
+        "Announcement time",
+        "Birthday GIF link",
+    }
     modal = FieldsModal("Test", [("zone", "Timezone", "UTC")], AsyncMock(), 10)
     assert modal.to_components()[0]["type"] == 18  # Modern Label, not a legacy ActionRow.
 
@@ -140,3 +152,56 @@ def test_logs_redact_bot_token_and_authorization():
     assert "super-secret-token" not in output
     assert "abc.def" not in output
     assert "Bearer xyz" not in output
+
+
+def test_gif_url_canonicalizes_markup_and_cannot_break_a_link():
+    value = gif_url("HTTPS://STATIC.KLIPY.COM:443/a](evil)`<x>.gif")
+    assert value == "https://static.klipy.com/a%5D%28evil%29%60%3Cx%3E.gif"
+    assert not any(char in value for char in "[]()`<>")
+
+
+async def test_time_and_gif_are_menu_forms_with_save_and_validation(db):
+    from birthdaybot.work_queue import WorkQueue
+
+    queue = WorkQueue()
+    bot = SimpleNamespace(db=db, queue=queue, mutation_lock=asyncio.Lock(), config=Config("test"))
+    view = SettingsWizard(bot, 10, await db.guild(1))
+    value = interaction(mod=True)
+    value.response.send_modal = AsyncMock()
+    value.response.edit_message = AsyncMock()
+    value.response.is_done.return_value = False
+    value.edit_original_response = AsyncMock()
+
+    # These select options must open a modal as the initial response; deferring
+    # them through the queue would produce InteractionResponded on Discord.
+    menu = view.children[0]
+    menu._values = ["time"]
+    await menu.callback(value)
+    modal = value.response.send_modal.call_args.args[0]
+    assert modal.inputs["time"].default == "00:00"
+    await modal.submit(value, {"time": "18:45"})
+    assert (await db.guild(1))["hour"] == 0  # Draft only until Save.
+    assert (view.hour, view.minute) == (18, 45)
+    await view.reset_midnight(value)
+    assert (view.hour, view.minute) == (0, 0)
+
+    menu = view.children[0]
+    menu._values = ["gif"]
+    await menu.callback(value)
+    modal = value.response.send_modal.call_args.args[0]
+    with pytest.raises(ValueError):
+        await modal.submit(value, {"gif": "https://evil.example/image.gif"})
+    assert view.gif == ""
+    await modal.submit(value, {"gif": "https://static.klipy.com/birthday(cake).gif"})
+    assert view.gif == "https://static.klipy.com/birthday%28cake%29.gif"
+    assert f"[Open GIF]({view.gif})" in view.content()
+    assert (await db.guild(1))["gif"] == ""
+
+    # A custom time can still be selected after using the midnight preset.
+    await view.edit_time(value)
+    modal = value.response.send_modal.call_args.args[0]
+    await modal.submit(value, {"time": "18:45"})
+    value.response.is_done.return_value = True
+    await view.save(value)
+    saved = await db.guild(1)
+    assert (saved["hour"], saved["minute"], saved["gif"]) == (18, 45, view.gif)
