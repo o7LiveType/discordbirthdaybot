@@ -1,5 +1,7 @@
 # Birthday bot
 
+Authored by [o7LiveType](https://github.com/o7LiveType) with [Codex](https://openai.com/codex/).
+
 A Python 3.12 Discord bot with a public birthday calendar, configurable moderator-only browsing, and optional birthday celebrations. Uses Discord application commands, simple month/day/timezone menus, timezone autocomplete, modern labelled modal forms, channel selectors, confirmation buttons, and ephemeral replies.
 
 ## Quick start
