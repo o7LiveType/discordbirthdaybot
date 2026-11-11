@@ -1,0 +1,76 @@
+"""Calendar rules. Birth years are never requested or stored."""
+
+import calendar
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+
+ZONES = sorted(available_timezones() - {"localtime", "posixrules"})
+LEAP_POLICIES = {"feb28", "mar1", "leap_only"}
+
+
+def timezone(value: str) -> str:
+    value = value.strip()
+    if value not in ZONES:
+        raise ValueError("Choose an IANA timezone, for example America/Denver or Europe/London.")
+    try:
+        ZoneInfo(value)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("That timezone is unavailable on this host.") from exc
+    return value
+
+
+def clock(value: str) -> tuple[int, int]:
+    try:
+        if len(value) != 5 or value[2] != ":":
+            raise ValueError
+        hour, minute = map(int, value.split(":"))
+        time(hour, minute)
+        return hour, minute
+    except ValueError as exc:
+        raise ValueError("Use a 24-hour time in HH:MM form, for example 09:00 or 18:30.") from exc
+
+
+def anniversary(month: int, day: int, year: int, leap: str) -> date | None:
+    date(2000, month, day)  # Accept Feb 29, reject impossible dates.
+    if leap not in LEAP_POLICIES:
+        raise ValueError("Invalid leap-day policy.")
+    if (month, day) == (2, 29) and not calendar.isleap(year):
+        return {"feb28": date(year, 2, 28), "mar1": date(year, 3, 1), "leap_only": None}[leap]
+    return date(year, month, day)
+
+
+def scheduled_at(day: date, zone: str, hour: int, minute: int) -> datetime:
+    """First fold on repeated times; first real minute after a DST gap.
+
+    Round-trip via UTC detects imaginary wall times. Also handles historical
+    whole-day skips; the scheduler won't send on a different local birthday.
+    """
+    wall = datetime.combine(day, time(hour, minute))
+    tz = ZoneInfo(zone)
+    for offset in range(24 * 60 + 1):
+        candidate = (wall + timedelta(minutes=offset)).replace(tzinfo=tz, fold=0)
+        if candidate.astimezone(UTC).astimezone(tz).replace(tzinfo=None) == candidate.replace(
+            tzinfo=None
+        ):
+            return candidate.astimezone(UTC)
+    raise ValueError("No valid wall time within a day of the selected time.")
+
+
+def due(record, now: datetime) -> datetime | None:
+    local = now.astimezone(ZoneInfo(record["timezone"]))
+    day = anniversary(record["month"], record["day"], local.year, record["leap"])
+    if day != local.date():
+        return None
+    target = scheduled_at(day, record["timezone"], record["hour"], record["minute"])
+    return target if now >= target else None
+
+
+def next_occurrence(record, now: datetime) -> datetime:
+    local = now.astimezone(ZoneInfo(record["timezone"]))
+    for year in range(local.year, local.year + 9):
+        day = anniversary(record["month"], record["day"], year, record["leap"])
+        if day is not None:
+            target = scheduled_at(day, record["timezone"], record["hour"], record["minute"])
+            if target >= now and target.astimezone(ZoneInfo(record["timezone"])).date() == day:
+                return target
+    raise ValueError("No upcoming anniversary found.")
