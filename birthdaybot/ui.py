@@ -161,7 +161,7 @@ class BirthdayWizard(OwnedView):
                 if self.public_birthdays
                 else "Birthday browsing is restricted to moderators in this server. "
             )
-            + "Turn announcements OFF to hide your date from public lists and birthday posts."
+            + "Turn sharing OFF to hide your date and stop birthday posts and DMs."
         )
 
     def build(self):
@@ -328,9 +328,9 @@ class BirthdayWizard(OwnedView):
             f"✅ Birthday {'updated' if self.update else 'saved'}: **{calendar.month_name[self.month]} {self.day}**\n"
             f"Timezone: **{self.zone.replace('_', ' ')}**\n"
             + (
-                "You opted out of public birthday lists and announcements."
+                "You opted out of public birthday lists, announcements and birthday DMs."
                 if self.opt_out
-                else "We'll celebrate in the birthday channel on your birthday."
+                else "We'll celebrate in the birthday channel and DM you with the server's name on your birthday."
                 + (
                     " Your month and day are also shared in the public birthday list."
                     if settings["public_birthdays"]

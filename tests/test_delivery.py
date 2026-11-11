@@ -17,9 +17,13 @@ async def fixture(db):
     channel.guild.id = 1
     channel.permissions_for.return_value = discord.Permissions.all()
     channel.send = AsyncMock(return_value=SimpleNamespace(id=500))
-    member = SimpleNamespace(id=2, mention="<@2>", bot=False)
+    dm_channel = SimpleNamespace(id=200, send=AsyncMock(return_value=SimpleNamespace(id=700)))
+    member = SimpleNamespace(
+        id=2, mention="<@2>", bot=False, create_dm=AsyncMock(return_value=dm_channel)
+    )
     guild = MagicMock()
     guild.id = 1
+    guild.name = "Test server"
     guild.get_channel.return_value = channel
     guild.fetch_member = AsyncMock(return_value=member)
     bot = MagicMock()
@@ -139,9 +143,11 @@ async def test_retry_channel_change_records_actual_destination_for_recovery(db):
 async def test_midnight_crossing_during_member_lookup_prevents_late_send(db):
     scheduler, guild, channel = await fixture(db)
     scheduler.bot.live_clock = True
+    record = await db.birthday(1, 2)
+    job = await db.claim(record, 2026, 100, NOW.timestamp())
     with patch("birthdaybot.delivery.datetime") as mocked:
-        mocked.now.side_effect = [NOW, NOW + timedelta(days=1)]
-        await scheduler.tick(NOW)
+        mocked.now.return_value = NOW + timedelta(days=1)
+        await scheduler.send(record, job, await db.guild(1), guild, NOW)
     channel.send.assert_not_awaited()
 
 
@@ -151,12 +157,12 @@ async def test_post_expires_after_24_hours_even_after_record_deletion_and_restar
     message = SimpleNamespace(delete=AsyncMock())
     scheduler.bot.get_partial_messageable.return_value.get_partial_message.return_value = message
     await db.forget(1, 2)
-    assert len(await db.read("SELECT * FROM cleanup")) == 1
+    assert len(await db.read("SELECT * FROM cleanup")) == 2
     restarted = Scheduler(scheduler.bot)
     await restarted.tick(NOW + timedelta(hours=23, minutes=59))
     message.delete.assert_not_awaited()
     await restarted.tick(NOW + timedelta(hours=24))
-    message.delete.assert_awaited_once()
+    assert message.delete.await_count == 2
     assert not await db.read("SELECT * FROM cleanup")
 
 
@@ -166,6 +172,7 @@ async def test_failed_cleanup_retries_durably_and_already_deleted_is_success(db)
     delete = AsyncMock(
         side_effect=[
             discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Denied"),
+            discord.NotFound(SimpleNamespace(status=404, reason="Not found"), "Gone"),
             discord.NotFound(SimpleNamespace(status=404, reason="Not found"), "Gone"),
         ]
     )

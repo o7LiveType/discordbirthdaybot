@@ -99,24 +99,30 @@ async def test_admin_time_change_applies_to_existing_records(db):
 
 async def test_new_servers_default_to_midnight(db):
     assert ((await db.guild(1))["hour"], (await db.guild(1))["minute"]) == (0, 0)
-    assert (await db.guild(1))["timezone"] == "America/New_York"
+    assert (await db.guild(1))["timezone"] == "UTC"
 
 
-async def test_new_york_prefill_migration_preserves_explicit_member_timezones(db):
+@pytest.mark.parametrize(
+    ("legacy_version", "legacy_zone", "member_zone"),
+    [(5, "America/Denver", "Asia/Tokyo"), (6, "America/New_York", "America/New_York")],
+)
+async def test_utc_prefill_migration_preserves_explicit_member_timezones(
+    db, legacy_version, legacy_zone, member_zone
+):
     await db.ensure_guild(2)
-    await db.configure(1, 100, None, "America/Denver", 0, 0, "")
+    await db.configure(1, 100, None, legacy_zone, 0, 0, "")
     await db.configure(2, 200, None, "Europe/London", 0, 0, "")
-    await db.save(1, 10, 1, 1, "Asia/Tokyo", 0, 0, "feb28", True)
+    await db.save(1, 10, 1, 1, member_zone, 0, 0, "feb28", True)
     async with db.transaction() as conn:
-        await conn.execute("PRAGMA user_version=5")
+        await conn.execute(f"PRAGMA user_version={legacy_version}")  # noqa: S608 - test integer versions
     upgraded = Database(db.path)
     await upgraded.open()
     try:
-        assert (await upgraded.guild(1))["timezone"] == "America/New_York"
+        assert (await upgraded.guild(1))["timezone"] == "UTC"
         assert (await upgraded.guild(2))["timezone"] == "Europe/London"
-        assert (await upgraded.birthday(1, 10))["timezone"] == "Asia/Tokyo"
+        assert (await upgraded.birthday(1, 10))["timezone"] == member_zone
         await upgraded.ensure_guild(3)
-        assert (await upgraded.guild(3))["timezone"] == "America/New_York"
+        assert (await upgraded.guild(3))["timezone"] == "UTC"
     finally:
         await upgraded.close()
 

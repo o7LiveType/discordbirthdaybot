@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+from .dm import BirthdayDMs
 from .timeutil import due
 
 log = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class Scheduler:
         self.db = bot.db
         self.last_tick = None
         self.last_success = None
+        self.dms = BirthdayDMs(bot, self.alert)
 
     async def alert(self, settings, code, detail):
         if not await self.db.notice_due(settings["guild_id"], code, datetime.now(UTC).timestamp()):
@@ -88,6 +90,7 @@ class Scheduler:
                 async with self.bot.mutation_lock:
                     await self.reconcile(job, await self.db.guild(job["guild_id"]))
         await self.cleanup_messages(now)
+        self.backlog = await self.dms.tick(now) or self.backlog
         settings_by_id = {r["guild_id"]: r for r in await self.db.read("SELECT * FROM guilds")}
         if not hasattr(self, "_health_check") or (now - self._health_check).total_seconds() >= 300:
             for settings in settings_by_id.values():
@@ -149,7 +152,7 @@ class Scheduler:
                             "delivery_reconciled guild=%s marker=%s", job["guild_id"], job["marker"]
                         )
                         return
-            except discord.HTTPException:
+            except (discord.HTTPException, OSError, TimeoutError):
                 log.warning("reconciliation_history_unavailable guild=%s", job["guild_id"])
         await self.db.delivery_state(
             job,
@@ -178,7 +181,7 @@ class Scheduler:
             await self.db.forget(guild.id, record["user_id"])
             log.info("departed_member_record_removed guild=%s user=%s", guild.id, record["user_id"])
             return
-        except discord.HTTPException:
+        except (discord.HTTPException, OSError, TimeoutError):
             await self.retry(job, now, "Could not verify server membership")
             return
         if member.bot:

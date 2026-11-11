@@ -11,7 +11,7 @@ import aiosqlite
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
  guild_id INTEGER PRIMARY KEY, channel_id INTEGER, alert_channel_id INTEGER,
- timezone TEXT NOT NULL DEFAULT 'America/New_York', hour INTEGER NOT NULL DEFAULT 0 CHECK(hour BETWEEN 0 AND 23),
+ timezone TEXT NOT NULL DEFAULT 'UTC', hour INTEGER NOT NULL DEFAULT 0 CHECK(hour BETWEEN 0 AND 23),
  minute INTEGER NOT NULL DEFAULT 0 CHECK(minute BETWEEN 0 AND 59),
  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), gif TEXT NOT NULL DEFAULT '',
  leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only')),
@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS notices (
  guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
  code TEXT NOT NULL, last_at REAL NOT NULL, PRIMARY KEY(guild_id,code)
 );
+CREATE TABLE IF NOT EXISTS dm_deliveries (
+ guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+ user_id INTEGER NOT NULL, year INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('ready','sending','sent','retry','uncertain','blocked','skipped')),
+ marker TEXT NOT NULL UNIQUE, channel_id INTEGER NOT NULL DEFAULT 0,
+ created_at REAL NOT NULL, retry_at REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+ message_id INTEGER, error TEXT, PRIMARY KEY(guild_id,user_id,year)
+);
+CREATE INDEX IF NOT EXISTS dm_delivery_queue ON dm_deliveries(retry_at,created_at)
+ WHERE state IN ('ready','retry','sending','uncertain');
 CREATE TABLE IF NOT EXISTS receipts (
  guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
  user_id INTEGER NOT NULL, year INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id,year)
@@ -59,7 +69,7 @@ CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
 CREATE INDEX IF NOT EXISTS birthdays_public_guild_date ON birthdays(guild_id,month,day,user_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=6;
+PRAGMA user_version=7;
 """
 
 
@@ -82,7 +92,7 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6):
+            if version not in (0, 1, 2, 3, 4, 5, 6, 7):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
@@ -114,6 +124,8 @@ class Database:
                 migration += (
                     "UPDATE guilds SET timezone='America/New_York' WHERE timezone='America/Denver';"
                 )
+            if version in (1, 2, 3, 4, 5, 6):
+                migration += "UPDATE guilds SET timezone='UTC' WHERE timezone='America/New_York';"
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
         except BaseException:
@@ -140,7 +152,7 @@ class Database:
         async with self.transaction() as conn:
             # Older database files still have the legacy SQL column default.
             await conn.execute(
-                "INSERT OR IGNORE INTO guilds(guild_id,timezone,hour,minute) VALUES (?,'America/New_York',0,0)",
+                "INSERT OR IGNORE INTO guilds(guild_id,timezone,hour,minute) VALUES (?,'UTC',0,0)",
                 (guild_id,),
             )
 
@@ -166,7 +178,8 @@ class Database:
         async with self.transaction() as conn:
             previous = await (
                 await conn.execute(
-                    "SELECT public_birthdays FROM guilds WHERE guild_id=?", (guild_id,)
+                    "SELECT public_birthdays,hour,minute,leap FROM guilds WHERE guild_id=?",
+                    (guild_id,),
                 )
             ).fetchone()
             await conn.execute(
@@ -190,6 +203,11 @@ class Database:
             )
             if public_birthdays is not None and previous and previous[0] != public_birthdays:
                 await self._invalidate_directories(conn, guild_id)
+            if previous and tuple(previous[1:]) != (hour, minute, leap):
+                await conn.execute(
+                    "UPDATE dm_deliveries SET retry_at=0 WHERE guild_id=? AND state IN ('ready','retry')",
+                    (guild_id,),
+                )
 
     async def pause(self, guild_id, paused):
         async with self.transaction() as conn:
@@ -231,6 +249,12 @@ class Database:
                 ),
             )
             await self._invalidate_directories(conn, guild_id)
+            # Pending greetings follow the latest date, timezone and opt-out.
+            # Sent, blocked and ambiguous jobs remain as annual anti-spam receipts.
+            await conn.execute(
+                "DELETE FROM dm_deliveries WHERE guild_id=? AND user_id=? AND state IN ('ready','retry','skipped')",
+                (guild_id, user_id),
+            )
 
     async def directory(self, guild_id, *, public_only=True, month=None, page=0):
         """Return one indexed calendar page and aggregate counts in one snapshot."""
@@ -303,16 +327,17 @@ class Database:
                 (message_id, guild_id, channel_id, created_at + 86400),
             )
 
-    async def candidates(self, now):
+    async def candidates(self, now, *, dm=False):
         days = {(now + timedelta(hours=offset)).date() for offset in (-12, 0, 14)}
         pairs = {(day.month, day.day) for day in days}
         if any((day.month, day.day) in {(2, 28), (3, 1)} for day in days):
             pairs.add((2, 29))
         terms = " OR ".join("(b.month=? AND b.day=?)" for _ in pairs)
         parameters = [value for pair in sorted(pairs) for value in pair]
+        receipt_table = "dm_deliveries" if dm else "receipts"
         query = f"""SELECT b.* FROM birthdays b JOIN guilds g ON g.guild_id=b.guild_id
           WHERE b.consent=1 AND g.enabled=1 AND ({terms})
-          AND NOT EXISTS (SELECT 1 FROM receipts d WHERE d.guild_id=b.guild_id AND d.user_id=b.user_id
+          AND NOT EXISTS (SELECT 1 FROM {receipt_table} d WHERE d.guild_id=b.guild_id AND d.user_id=b.user_id
           AND d.year=CASE WHEN b.month=1 AND ?=12 THEN ?+1
                           WHEN b.month=12 AND ?=1 THEN ?-1 ELSE ? END
           ) ORDER BY b.guild_id,b.user_id"""  # noqa: S608 - fixed SQL fragments only
@@ -332,6 +357,58 @@ class Database:
                 "DELETE FROM birthdays WHERE guild_id=? AND user_id=?", (guild_id, user_id)
             )
             await self._invalidate_directories(conn, guild_id)
+            await conn.execute(
+                "DELETE FROM dm_deliveries WHERE guild_id=? AND user_id=? AND state IN ('ready','retry','skipped')",
+                (guild_id, user_id),
+            )
+
+    async def claim_dm(self, record, year, now):
+        async with self.transaction() as conn:
+            await conn.execute(
+                """INSERT OR IGNORE INTO dm_deliveries
+                (guild_id,user_id,year,state,marker,created_at) VALUES (?,?,?,'ready',?,?)""",
+                (record["guild_id"], record["user_id"], year, uuid4().hex[:20], now),
+            )
+        return await self.dm_job(record["guild_id"], record["user_id"], year)
+
+    async def dm_job(self, guild_id, user_id, year):
+        rows = await self.read(
+            "SELECT * FROM dm_deliveries WHERE guild_id=? AND user_id=? AND year=?",
+            (guild_id, user_id, year),
+        )
+        return rows[0] if rows else None
+
+    async def dm_state(
+        self,
+        job,
+        state,
+        *,
+        error=None,
+        retry_at=0,
+        channel_id=None,
+        message_id=None,
+        delete_at=None,
+    ):
+        async with self.transaction() as conn:
+            await conn.execute(
+                """UPDATE dm_deliveries SET state=?,error=?,retry_at=?,
+                channel_id=COALESCE(?,channel_id),message_id=COALESCE(?,message_id),attempts=attempts+?
+                WHERE marker=?""",
+                (
+                    state,
+                    error,
+                    retry_at,
+                    channel_id,
+                    message_id,
+                    int(state in {"sending", "retry"}),
+                    job["marker"],
+                ),
+            )
+            if state == "sent" and message_id is not None and delete_at is not None:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO cleanup(message_id,guild_id,channel_id,delete_at) VALUES (?,?,?,?)",
+                    (message_id, job["guild_id"], channel_id or job["channel_id"], delete_at),
+                )
 
     async def drop_guild(self, guild_id):
         async with self.transaction() as conn:

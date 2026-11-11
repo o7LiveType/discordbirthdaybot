@@ -113,7 +113,7 @@ def install(bot):
 
     @birthday.command(name="set", description="Set your birthday with a simple private menu")
     @app_commands.describe(
-        opt_out="Hide your birthday from public lists and announcements",
+        opt_out="Hide your date from public lists and stop birthday posts and DMs",
         timezone="Optional: type a city to find your timezone",
     )
     @queued(bot)
@@ -126,7 +126,7 @@ def install(bot):
         name="update", description="Update your birthday, timezone or announcement opt-out"
     )
     @app_commands.describe(
-        opt_out="Hide your birthday from public lists and announcements (True), or share it (False)",
+        opt_out="Hide your date and disable birthday posts/DMs (True), or share it (False)",
         timezone="Optional: type a city to find your timezone",
     )
     @queued(bot)
@@ -212,7 +212,7 @@ def install(bot):
             "`/birthday update` → change those details.\n"
             "`/birthday me` → check what you saved.\n"
             "`/birthday delete` → remove it.\n\n"
-            "Press Save to confirm. Opting out hides your date from public lists and announcements. "
+            "Press Save to confirm. Opting out hides your date and stops birthday announcements and DMs. "
             "Servers can restrict birthday browsing to moderators. Timezones stay private; no birth year is collected.",
         )
 
@@ -330,6 +330,10 @@ def install(bot):
             "SELECT state,count(*) AS n FROM deliveries WHERE guild_id=? GROUP BY state",
             (interaction.guild_id,),
         )
+        dm_counts = await bot.db.read(
+            "SELECT state,count(*) AS n FROM dm_deliveries WHERE guild_id=? GROUP BY state",
+            (interaction.guild_id,),
+        )
         mode = (await bot.db.read("PRAGMA journal_mode"))[0][0]
         sync = (await bot.db.read("PRAGMA synchronous"))[0][0]
         issues = channel_issues(
@@ -351,6 +355,8 @@ def install(bot):
             f"GIF configured: {bool(settings['gif'] or bot.config.gif)}\n"
             "Deliveries: "
             + (", ".join(f"{r['state']}={r['n']}" for r in counts) or "none")
+            + "\nBirthday DMs: "
+            + (", ".join(f"{r['state']}={r['n']}" for r in dm_counts) or "none")
             + "\nChecks: "
             + (" ".join(issues) if issues else "channel permissions OK"),
         )
@@ -360,18 +366,21 @@ def install(bot):
     )
     @app_commands.check(require_mod)
     @queued(bot)
-    async def deliveries(interaction: discord.Interaction):
+    async def deliveries(
+        interaction: discord.Interaction, kind: Literal["channel", "dm"] = "channel"
+    ):
         await defer(interaction)
+        table = "dm_deliveries" if kind == "dm" else "deliveries"
         rows = await bot.db.read(
-            "SELECT * FROM deliveries WHERE guild_id=? AND state NOT IN ('sent','skipped') ORDER BY created_at DESC LIMIT 15",
+            f"SELECT * FROM {table} WHERE guild_id=? AND state NOT IN ('sent','skipped','blocked') ORDER BY created_at DESC LIMIT 10",  # noqa: S608 - table from fixed choices
             (interaction.guild_id,),
         )
         await private(
             interaction,
-            "**Deliveries needing attention**\n"
+            f"**{kind.title()} deliveries needing attention**\n"
             + (
                 "\n".join(
-                    f"<@{r['user_id']}> · {r['year']} · {r['state']} · marker `{r['marker']}` · {r['error'] or 'queued'}"
+                    f"<@{r['user_id']}> · {r['year']} · {r['state']} · marker `{r['marker']}` · {(r['error'] or 'queued')[:80]}"
                     for r in rows
                 )
                 or "None."
@@ -392,6 +401,7 @@ def install(bot):
         action: Literal["mark_delivered", "retry", "skip"],
         checked_channel: bool,
         message_id: str | None = None,
+        kind: Literal["channel", "dm"] = "channel",
     ):
         if not checked_channel:
             await private(
@@ -401,14 +411,16 @@ def install(bot):
             return
         await defer(interaction)
         async with bot.mutation_lock:
+            table = "dm_deliveries" if kind == "dm" else "deliveries"
             rows = await bot.db.read(
-                "SELECT * FROM deliveries WHERE guild_id=? AND user_id=? AND year=? AND state IN ('uncertain','sending','retry')",
+                f"SELECT * FROM {table} WHERE guild_id=? AND user_id=? AND year=? AND state IN ('uncertain','sending','retry')",  # noqa: S608 - table from fixed choices
                 (interaction.guild_id, member.id, year),
             )
             if not rows:
                 await private(interaction, "No unresolved delivery matches that member and year.")
                 return
             state = {"mark_delivered": "sent", "retry": "retry", "skip": "skipped"}[action]
+            footer = "Birthday DM" if kind == "dm" else "Birthday delivery"
             if state == "sent":
                 if not message_id or not message_id.isdecimal():
                     await private(
@@ -419,17 +431,20 @@ def install(bot):
                 channel = bot.get_partial_messageable(rows[0]["channel_id"])
                 message = await channel.fetch_message(int(message_id))
                 if message.author.id != bot.user.id or not any(
-                    e.footer.text == f"Birthday delivery {rows[0]['marker']}"
-                    for e in message.embeds
+                    e.footer.text == f"{footer} {rows[0]['marker']}" for e in message.embeds
                 ):
                     await private(
                         interaction,
                         "That message does not match this delivery's author and marker.",
                     )
                     return
-                await bot.scheduler.confirm_sent(rows[0], message)
+                if kind == "dm":
+                    await bot.scheduler.dms.confirm(rows[0], message)
+                else:
+                    await bot.scheduler.confirm_sent(rows[0], message)
             else:
-                await bot.db.delivery_state(rows[0], state, error="Manually resolved by moderator")
+                change_state = bot.db.dm_state if kind == "dm" else bot.db.delivery_state
+                await change_state(rows[0], state, error="Manually resolved by moderator")
         log.info(
             "delivery_resolved guild=%s user=%s year=%s actor=%s action=%s",
             interaction.guild_id,
