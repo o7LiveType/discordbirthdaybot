@@ -104,6 +104,20 @@ Keep `.env`, `data/`, and `logs/` persistent under `/home/container` across upda
 
 Runtime defaults: `DATABASE_PATH=data/birthdays.sqlite3`, `LOG_DIR=logs`, `LOG_LEVEL=INFO`. Log files rotate at 5 MB with five backups, plus panel stdout logs. Configure the panel's own log retention. Start with a modest memory allocation (for example 256 MiB) and observe actual usage before sizing larger servers.
 
+## Standalone Linux service
+
+For a checkout at `~/discordbirthdaybot`, the included user service keeps the bot independent of an interactive terminal and automatically restarts it after an unexpected exit. Adjust the paths in `deploy/discordbirthdaybot.service` for another checkout location. Pterodactyl provides its own process supervision; use its Python startup command inside the panel instead of this service.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/discordbirthdaybot.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now discordbirthdaybot.service
+loginctl enable-linger "$USER"
+```
+
+Inspect status with `systemctl --user status discordbirthdaybot.service` and exit details with `journalctl --user -u discordbirthdaybot.service`. Restart after code updates using `systemctl --user restart discordbirthdaybot.service`. Use `systemctl --user stop discordbirthdaybot.service` before starting a panel instance with the same bot token. The service reads the checkout's ignored `.env` through the application; credentials are not embedded in the unit. Process start, shutdown signals, connection exit and completed shutdown are logged alongside scheduler heartbeats. The journal retains exit status when the process cannot write an application traceback, such as a forced termination.
+
 ## SQLite durability and backup
 
 Every connection used by the bot explicitly enables and verifies **`journal_mode=WAL` and `synchronous=FULL`**, with foreign keys, a five-second busy timeout, serialized `BEGIN IMMEDIATE` transactions, rollback on cancellation, schema version checks, and graceful WAL checkpointing. `FULL` causes a WAL sync per transaction commit; see [SQLite's documentation](https://sqlite.org/pragma.html#pragma_synchronous). Use a local persistent filesystem with reliable fsync semantics. Durability depends on the panel host, filesystem, and storage honoring flushes; SQLite cannot compensate for a lost volume or dishonest storage. Network shares are unsuitable for this WAL database.

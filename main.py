@@ -19,25 +19,38 @@ async def run(config):
     with process_lock(config.database.with_suffix(".lock")):
         async with BirthdayBot(config) as bot:
             loop = asyncio.get_running_loop()
+
+            def request_shutdown(signum):
+                logging.getLogger(__name__).info("shutdown_requested signal=%s", signum.name)
+                asyncio.create_task(bot.close())
+
             for signum in (signal.SIGTERM, signal.SIGINT):
                 try:
-                    loop.add_signal_handler(signum, lambda: asyncio.create_task(bot.close()))
+                    loop.add_signal_handler(signum, request_shutdown, signum)
                 except NotImplementedError:
                     pass
-            await bot.start(config.token)
+            try:
+                await bot.start(config.token)
+            finally:
+                logging.getLogger(__name__).info(
+                    "bot_connection_finished closed=%s", bot.is_closed()
+                )
+    logging.getLogger(__name__).info("bot_shutdown_complete")
 
 
 def main():
     os.umask(0o077)
     try:
         config = Config.load()
-        configure(config.log_dir, config.log_level, config.token)
-        asyncio.run(run(config))
-    except KeyboardInterrupt:
-        pass
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
+    try:
+        configure(config.log_dir, config.log_level, config.token)
+        logging.getLogger(__name__).info("bot_process_start pid=%s", os.getpid())
+        asyncio.run(run(config))
+    except KeyboardInterrupt:
+        pass
     except Exception:
         logging.getLogger(__name__).exception("bot_fatal_exit")
         return 1
