@@ -227,7 +227,7 @@ class Database:
         from .timeutil import anniversary, timezone
 
         anniversary(month, day, 2000, leap)
-        timezone(zone)
+        zone = timezone(zone)
         time(hour, minute)
         async with self.transaction() as conn:
             await conn.execute(

@@ -48,7 +48,7 @@ class PrivateTree(app_commands.CommandTree):
                 "permission_denied guild=%s user=%s", interaction.guild_id, interaction.user.id
             )
         elif isinstance(error, app_commands.CommandNotFound):
-            message = "That is an old command cached by Discord. Reopen the command picker and use /birthday set or /birthday-admin setup."
+            message = "That is an old command cached by Discord. Reopen the command picker and use /birthdaybot."
             log.warning(
                 "stale_command guild=%s name=%s",
                 interaction.guild_id,
@@ -108,6 +108,7 @@ class BirthdayBot(discord.AutoShardedClient):
             self.directory_refreshes.pop(old_key, None)
 
     def track_view(self, view, guild_id, user_id):
+        view.guild_id = guild_id
         key = (guild_id, user_id)
         previous = self.active_views.pop(key, None)
         if previous:

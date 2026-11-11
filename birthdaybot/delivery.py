@@ -57,7 +57,7 @@ class Scheduler:
             try:
                 await channel.send(
                     f"⚠️ **Birthday bot needs attention**\n{detail}\n"
-                    "Use `/birthday-admin status` to investigate. Repeats at most hourly.",
+                    "Open `/birthdaybot` → Server tools → Status to investigate. Repeats at most hourly.",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except (discord.HTTPException, OSError, TimeoutError) as exc:
@@ -164,7 +164,7 @@ class Scheduler:
             settings,
             "uncertain",
             "A delivery needs review to avoid a duplicate birthday post. "
-            "Check `/birthday-admin deliveries`, then use `/birthday-admin resolve`.",
+            "Open `/birthdaybot` → Server tools → Channel deliveries to review it.",
         )
 
     async def send(self, record, job, settings, guild, now):

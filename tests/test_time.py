@@ -98,3 +98,52 @@ def test_local_midnight_is_due_at_the_configured_zone_boundary(
     target = datetime(2026, utc_month, utc_day, utc_hour, utc_minute, tzinfo=UTC)
     assert due(value, target - timedelta(seconds=1)) is None
     assert due(value, target) == target
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "@everyone",
+        "UTC\n",
+        "UTC\x00",
+        "UTC\t",
+        "../UTC",
+        "https://example.com",
+        "UTC`",
+        "ｕｔｃ",
+        "x" * 81,
+    ],
+)
+def test_timezone_search_rejects_unsafe_input(value):
+    from birthdaybot.timeutil import find_timezones
+
+    with pytest.raises(ValueError):
+        find_timezones(value)
+
+
+def test_timezone_search_canonicalizes_bounds_and_disambiguates():
+    from birthdaybot.timeutil import find_timezones
+
+    assert timezone(" america/new york ") == "America/New_York"
+    assert find_timezones("newyork") == ["America/New_York"]
+    assert find_timezones("utc") == ["UTC"]
+    assert 1 < len(find_timezones("Indiana")) <= 24
+    for value in ("America", "ThisCityDoesNotExist"):
+        with pytest.raises(ValueError):
+            find_timezones(value)
+
+
+@pytest.mark.parametrize(
+    ("zone", "month", "offset"),
+    [
+        ("UTC", 1, "+00:00"),
+        ("America/New_York", 1, "-05:00"),
+        ("America/New_York", 7, "-04:00"),
+        ("Asia/Kathmandu", 1, "+05:45"),
+        ("America/St_Johns", 1, "-03:30"),
+    ],
+)
+def test_timezone_labels_show_current_dst_and_fractional_offset(zone, month, offset):
+    from birthdaybot.timeutil import timezone_label
+
+    assert timezone_label(zone, datetime(2026, month, 1, tzinfo=UTC)) == f"{zone} · UTC{offset} now"

@@ -6,7 +6,7 @@ import discord
 
 from .config import DEFAULT_GIF, gif_url
 from .delivery import channel_issues
-from .timeutil import anniversary, clock, timezone
+from .timeutil import anniversary, find_timezones, timezone, timezone_label
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,14 @@ async def defer(interaction):
 
 
 async def edit(interaction, **kwargs):
+    content = kwargs.get("content")
+    if isinstance(content, str) and len(content) > 2000:
+        # A valid media URL can be 2048 characters on its own. Keep the full
+        # clickable link in an embed rather than sending an invalid message.
+        kwargs["content"] = None
+        kwargs["embed"] = discord.Embed(description=content, color=0xF6B5D7)
+    elif isinstance(content, str):
+        kwargs.setdefault("embed", None)
     if interaction.response.is_done():
         await interaction.edit_original_response(**kwargs)
     else:
@@ -60,15 +68,44 @@ class OwnedView(discord.ui.View):
                     and item.values[0] in getattr(callback, "opens_modal_values", {"custom"})
                 ):
                     return await callback(interaction)
-                return await self.queue.run(
-                    interaction, lambda: callback(interaction), update=True, rate_checked=True
-                )
+
+                async def execute():
+                    if (
+                        (not getattr(self, "public", False) and interaction.user.id != self.owner)
+                        or not interaction.guild
+                        or interaction.guild_id != getattr(self, "guild_id", interaction.guild_id)
+                        or (
+                            getattr(self, "public", False)
+                            and not isinstance(interaction.user, discord.Member)
+                        )
+                    ):
+                        await private(
+                            interaction,
+                            "This private menu belongs to someone else. Open /birthdaybot yourself.",
+                        )
+                        return
+                    if self.is_finished():
+                        await private(interaction, "This menu expired. Open /birthdaybot again.")
+                        return
+                    if self.admin and not moderator(interaction):
+                        await private(interaction, "You need Manage Server permission to continue.")
+                        return
+                    return await callback(interaction)
+
+                return await self.queue.run(interaction, execute, update=True, rate_checked=True)
 
             item.callback = run
         return super().add_item(item)
 
     async def interaction_check(self, interaction):
-        if interaction.user.id != self.owner or not interaction.guild:
+        if self.is_finished():
+            await private(interaction, "This menu expired. Open /birthdaybot again.")
+            return False
+        if (
+            interaction.user.id != self.owner
+            or not interaction.guild
+            or interaction.guild_id != getattr(self, "guild_id", interaction.guild_id)
+        ):
             await private(
                 interaction, "This private menu belongs to someone else. Run the command yourself."
             )
@@ -88,6 +125,9 @@ class OwnedView(discord.ui.View):
         return True
 
     async def on_error(self, interaction, error, item):
+        if isinstance(error, ValueError):
+            await private(interaction, str(error))
+            return
         log.error("component_failed type=%s user=%s", type(error).__name__, interaction.user.id)
         await private(
             interaction,
@@ -96,11 +136,13 @@ class OwnedView(discord.ui.View):
 
 
 class FieldsModal(discord.ui.Modal):
-    def __init__(self, title, fields, callback, owner, *, admin=False):
+    def __init__(self, title, fields, callback, owner, *, admin=False, queue=None, parent=None):
         super().__init__(title=title, timeout=300)
         self.submit = callback
         self.owner = owner
         self.admin = admin
+        self.queue = queue
+        self.parent = parent
         self.inputs = {}
         for key, label, default in fields:
             field = discord.ui.TextInput(
@@ -109,14 +151,38 @@ class FieldsModal(discord.ui.Modal):
             self.inputs[key] = field
             self.add_item(discord.ui.Label(text=label, component=field))
 
+    def authorized(self, interaction):
+        return (
+            bool(interaction.guild)
+            and interaction.user.id == self.owner
+            and (not self.admin or moderator(interaction))
+            and (
+                self.parent is None
+                or (not self.parent.is_finished() and interaction.guild_id == self.parent.guild_id)
+            )
+        )
+
     async def on_submit(self, interaction):
-        if interaction.user.id != self.owner or (self.admin and not moderator(interaction)):
+        if not self.authorized(interaction):
             await private(interaction, "You no longer have access to this form.")
             return
         try:
-            await self.submit(
-                interaction, {key: field.value.strip() for key, field in self.inputs.items()}
-            )
+
+            async def submit():
+                if not self.authorized(interaction):
+                    await private(
+                        interaction,
+                        "This form expired or you no longer have access. Open /birthdaybot again.",
+                    )
+                    return
+                await self.submit(
+                    interaction, {key: field.value for key, field in self.inputs.items()}
+                )
+
+            if self.queue is None:
+                await submit()
+            else:
+                await self.queue.run(interaction, submit, update=True)
         except ValueError as exc:
             await private(interaction, str(exc))
 
@@ -129,6 +195,16 @@ def button(label, callback, *, style=discord.ButtonStyle.secondary, row=4, disab
     item = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
     item.callback = callback
     return item
+
+
+def navigation(bot, owner, guild_id, *, admin=False):
+    if not hasattr(bot, "menu_actions"):
+        return None
+    view = OwnedView(owner, admin=admin, queue=bot.queue)
+    view.add_item(button("Main menu", bot.menu_actions["home"]))
+    if admin:
+        view.add_item(button("Server tools", bot.menu_actions["tools"]))
+    return bot.track_view(view, guild_id, owner)
 
 
 class BirthdayWizard(OwnedView):
@@ -146,6 +222,11 @@ class BirthdayWizard(OwnedView):
         self.day_page = int(bool(self.day and self.day >= 25))
         self.completed = False
         self.public_birthdays = bool(settings["public_birthdays"])
+        self.zone_valid = True
+        self.zone_matches = []
+        self.zone_notice = (
+            "✅ Valid timezone. The offset shown is current; daylight saving is automatic."
+        )
         self.build()
 
     def content(self):
@@ -153,7 +234,7 @@ class BirthdayWizard(OwnedView):
         return (
             "**Your birthday**\n"
             f"Month: **{month}**\nDay: **{self.day or 'Choose below'}**\n"
-            f"Timezone: **{self.zone.replace('_', ' ')}**\n"
+            f"Timezone: **{timezone_label(self.zone) if self.zone_valid else 'Choose a valid timezone below'}**\n{self.zone_notice}\n"
             f"Birthday sharing: **{'OFF (opted out)' if self.opt_out else 'ON'}**\n\n"
             "Choose your details, then **Save**. "
             + (
@@ -236,12 +317,14 @@ class BirthdayWizard(OwnedView):
             "Australia/Perth",
             "Pacific/Auckland",
         ]
-        zones = list(dict.fromkeys([self.zone] + common))[:24]
+        zones = self.zone_matches or list(dict.fromkeys([self.zone] + common))[:24]
         select = discord.ui.Select(
             placeholder="Timezone",
             row=2,
             options=[
-                discord.SelectOption(label=z.replace("_", " "), value=z, default=z == self.zone)
+                discord.SelectOption(
+                    label=timezone_label(z), value=z, default=z == self.zone and self.zone_valid
+                )
                 for z in zones
             ]
             + [discord.SelectOption(label="Other timezone…", value="custom")],
@@ -251,24 +334,28 @@ class BirthdayWizard(OwnedView):
             if select.values[0] == "custom":
 
                 async def submit(submission, values):
-                    value = timezone(values["zone"])
                     if self.is_finished():
                         await private(submission, "This menu expired. Run the command again.")
                         return
-                    self.zone = value
-                    self.build()
-                    await edit(submission, content=self.content(), view=self)
+                    await self.search_zone(submission, values["zone"])
 
                 await interaction.response.send_modal(
                     FieldsModal(
                         "Your timezone",
-                        [("zone", "IANA timezone, e.g. America/New_York", self.zone)],
+                        [("zone", "City or IANA timezone, e.g. New York", "")],
                         submit,
                         self.owner,
+                        queue=self.queue,
+                        parent=self,
                     )
                 )
                 return
-            self.zone = select.values[0]
+            self.zone = timezone(select.values[0])
+            self.zone_valid = True
+            self.zone_matches = []
+            self.zone_notice = (
+                "✅ Valid timezone. The offset shown is current; daylight saving is automatic."
+            )
             self.build()
             await edit(interaction, content=self.content(), view=self)
 
@@ -280,11 +367,30 @@ class BirthdayWizard(OwnedView):
                 self.save,
                 style=discord.ButtonStyle.success,
                 row=3,
-                disabled=not (self.month and self.day),
+                disabled=not (self.month and self.day and self.zone_valid),
             )
         )
         self.add_item(button("Sharing: " + ("OFF" if self.opt_out else "ON"), self.toggle, row=3))
         self.add_item(button("Cancel", self.cancel, row=3))
+
+    async def search_zone(self, interaction, query):
+        try:
+            matches = find_timezones(query)
+        except ValueError as exc:
+            self.zone_valid, self.zone_matches = False, []
+            self.zone_notice = f"❌ {exc} Choose a timezone below before saving."
+        else:
+            self.zone_matches = matches if len(matches) > 1 else []
+            self.zone_valid = len(matches) == 1
+            if self.zone_valid:
+                self.zone = matches[0]
+                self.zone_notice = "✅ Timezone validated. The offset shown is current; daylight saving is automatic."
+            else:
+                self.zone_notice = (
+                    f"⚠️ {len(matches)} valid matches. Choose your timezone below before saving."
+                )
+        self.build()
+        await edit(interaction, content=self.content(), view=self)
 
     async def toggle(self, interaction):
         self.opt_out = not self.opt_out
@@ -295,6 +401,9 @@ class BirthdayWizard(OwnedView):
         if self.completed:
             await private(interaction, "This menu was already saved.")
             return
+        if not self.zone_valid:
+            raise ValueError("Choose a valid timezone from the menu before saving.")
+        self.zone = timezone(self.zone)
         anniversary(self.month, self.day, 2000, "feb28")
         await defer(interaction)
         async with self.bot.mutation_lock:
@@ -302,13 +411,13 @@ class BirthdayWizard(OwnedView):
             record = await self.bot.db.birthday(self.guild_id, self.owner)
             if self.update and not record:
                 await private(
-                    interaction, "Your record was deleted. Use /birthday set to create it again."
+                    interaction, "Your record was deleted. Choose Set birthday in the main menu."
                 )
                 return
             if not self.update and record:
                 await private(
                     interaction,
-                    "Your birthday was already saved. Use /birthday update to change it.",
+                    "Your birthday was already saved. Choose Update birthday in the main menu.",
                 )
                 return
             await self.bot.db.save(
@@ -326,7 +435,7 @@ class BirthdayWizard(OwnedView):
         self.stop()
         result = (
             f"✅ Birthday {'updated' if self.update else 'saved'}: **{calendar.month_name[self.month]} {self.day}**\n"
-            f"Timezone: **{self.zone.replace('_', ' ')}**\n"
+            f"Timezone: **{timezone_label(self.zone)}**\n"
             + (
                 "You opted out of public birthday lists, announcements and birthday DMs."
                 if self.opt_out
@@ -337,11 +446,13 @@ class BirthdayWizard(OwnedView):
                     else ""
                 )
             )
-            + "\nUse `/birthday update` to change it or `/birthday delete` to remove it."
+            + "\nUse the main menu to update or delete your birthday."
         )
         if not settings["channel_id"] or not settings["enabled"]:
             result += "\n⚠️ A moderator needs to enable the birthday channel before announcements can post."
-        await interaction.edit_original_response(content=result, view=None)
+        await interaction.edit_original_response(
+            content=result, view=navigation(self.bot, self.owner, self.guild_id)
+        )
         log.info(
             "birthday_saved guild=%s user=%s action=%s opted_out=%s",
             self.guild_id,
@@ -352,14 +463,19 @@ class BirthdayWizard(OwnedView):
 
     async def cancel(self, interaction):
         self.stop()
-        await edit(interaction, content="Cancelled. Nothing was saved.", view=None)
+        await edit(
+            interaction,
+            content="Cancelled. Nothing was saved.",
+            view=navigation(self.bot, self.owner, self.guild_id),
+        )
 
 
 class Confirm(OwnedView):
-    def __init__(self, owner, callback, *, admin=False, queue=None):
+    def __init__(self, owner, callback, *, admin=False, queue=None, bot=None):
         super().__init__(owner, admin=admin, queue=queue)
         self.action = callback
         self.completed = False
+        self.bot = bot
         self.add_item(button("Confirm deletion", self.confirm, style=discord.ButtonStyle.danger))
         self.add_item(button("Cancel", self.cancel))
 
@@ -372,12 +488,17 @@ class Confirm(OwnedView):
         self.completed = True
         self.stop()
         await interaction.edit_original_response(
-            content="✅ Birthday record deleted from this server.", view=None
+            content="✅ Birthday record deleted from this server.",
+            view=navigation(self.bot, self.owner, interaction.guild_id, admin=self.admin),
         )
 
     async def cancel(self, interaction):
         self.stop()
-        await edit(interaction, content="Deletion cancelled.", view=None)
+        await edit(
+            interaction,
+            content="Deletion cancelled.",
+            view=navigation(self.bot, self.owner, interaction.guild_id, admin=self.admin),
+        )
 
 
 class SettingsWizard(OwnedView):
@@ -397,6 +518,7 @@ class SettingsWizard(OwnedView):
         self.channel_id, self.alert_id = settings["channel_id"], settings["alert_channel_id"]
         self.zone = settings["timezone"]
         self.hour, self.minute = settings["hour"], settings["minute"]
+        self.minute_band = self.minute // 20
         try:
             self.gif = gif_url(settings["gif"]) if settings["gif"] else ""
         except ValueError:
@@ -420,9 +542,6 @@ class SettingsWizard(OwnedView):
 
         async def navigate(interaction):
             choice = menu.values[0]
-            if choice == "time":
-                await self.edit_time(interaction)
-                return
             if choice == "gif":
                 await self.edit_gif(interaction)
                 return
@@ -430,7 +549,7 @@ class SettingsWizard(OwnedView):
             self.build()
             await edit(interaction, content=self.content(), view=self)
 
-        navigate.opens_modal_values = {"time", "gif"}
+        navigate.opens_modal_values = {"gif"}
         menu.callback = navigate
         self.add_item(menu)
         if self.section in {"channel", "alerts"}:
@@ -492,7 +611,65 @@ class SettingsWizard(OwnedView):
             choice.callback = choose_option
             self.add_item(choice)
         elif self.section == "time":
-            self.add_item(button("Midnight (00:00)", self.reset_midnight, row=2))
+            hours = discord.ui.Select(
+                placeholder="Hour (00–23)",
+                row=1,
+                options=[
+                    discord.SelectOption(
+                        label=f"Hour {hour:02}", value=str(hour), default=hour == self.hour
+                    )
+                    for hour in range(24)
+                ],
+            )
+
+            async def choose_hour(interaction):
+                self.hour = int(hours.values[0])
+                self.build()
+                await edit(interaction, content=self.content(), view=self)
+
+            hours.callback = choose_hour
+            self.add_item(hours)
+            bands = discord.ui.Select(
+                placeholder="Minute range",
+                row=2,
+                options=[
+                    discord.SelectOption(
+                        label=f"Minutes {band * 20:02}–{band * 20 + 19:02}",
+                        value=str(band),
+                        default=band == self.minute_band,
+                    )
+                    for band in range(3)
+                ],
+            )
+
+            async def choose_band(interaction):
+                self.minute_band = int(bands.values[0])
+                self.build()
+                await edit(interaction, content=self.content(), view=self)
+
+            bands.callback = choose_band
+            self.add_item(bands)
+            minutes = discord.ui.Select(
+                placeholder="Minute",
+                row=3,
+                options=[
+                    discord.SelectOption(
+                        label=f"Minute {minute:02}",
+                        value=str(minute),
+                        default=minute == self.minute,
+                    )
+                    for minute in range(self.minute_band * 20, self.minute_band * 20 + 20)
+                ],
+            )
+
+            async def choose_minute(interaction):
+                self.minute = int(minutes.values[0])
+                self.build()
+                await edit(interaction, content=self.content(), view=self)
+
+            minutes.callback = choose_minute
+            self.add_item(minutes)
+            self.add_item(button("Midnight (00:00)", self.reset_midnight))
         self.add_item(button("Save settings", self.save, style=discord.ButtonStyle.success))
         self.add_item(button("Cancel", self.cancel))
 
@@ -511,37 +688,11 @@ class SettingsWizard(OwnedView):
             "The time and leap-day rule apply to every birthday in this server."
         )
 
-    async def edit_time(self, interaction):
-        async def submit(submission, values):
-            hour, minute = clock(values["time"])
-            if self.is_finished():
-                await private(submission, "This menu expired. Run /birthday-admin setup again.")
-                return
-            self.hour, self.minute, self.section = hour, minute, "time"
-            self.build()
-            await edit(submission, content=self.content(), view=self)
-
-        await interaction.response.send_modal(
-            FieldsModal(
-                "Announcement time",
-                [
-                    (
-                        "time",
-                        "Local time (HH:MM; 00:00 = midnight)",
-                        f"{self.hour:02}:{self.minute:02}",
-                    )
-                ],
-                submit,
-                self.owner,
-                admin=True,
-            )
-        )
-
     async def edit_gif(self, interaction):
         async def submit(submission, values):
             value = gif_url(values["gif"]) if values["gif"] else ""
             if self.is_finished():
-                await private(submission, "This menu expired. Run /birthday-admin setup again.")
+                await private(submission, "This menu expired. Open /birthdaybot again.")
                 return
             self.gif, self.section = value, "gif"
             self.build()
@@ -554,11 +705,14 @@ class SettingsWizard(OwnedView):
                 submit,
                 self.owner,
                 admin=True,
+                queue=self.queue,
+                parent=self,
             )
         )
 
     async def reset_midnight(self, interaction):
         self.hour, self.minute, self.section = 0, 0, "time"
+        self.minute_band = 0
         self.build()
         await edit(interaction, content=self.content(), view=self)
 
@@ -593,8 +747,10 @@ class SettingsWizard(OwnedView):
                 self.public_birthdays,
             )
         self.stop()
-        await interaction.edit_original_response(
-            content="✅ Settings saved.\n" + self.content(), view=None
+        await edit(
+            interaction,
+            content="✅ Settings saved.\n" + self.content(),
+            view=navigation(self.bot, self.owner, self.guild_id, admin=True),
         )
         log.info(
             "guild_configured guild=%s actor=%s channel=%s",
@@ -605,4 +761,8 @@ class SettingsWizard(OwnedView):
 
     async def cancel(self, interaction):
         self.stop()
-        await edit(interaction, content="Cancelled. Settings were not changed.", view=None)
+        await edit(
+            interaction,
+            content="Cancelled. Settings were not changed.",
+            view=navigation(self.bot, self.owner, self.guild_id, admin=True),
+        )

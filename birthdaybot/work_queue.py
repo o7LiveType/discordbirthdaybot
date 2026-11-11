@@ -72,7 +72,8 @@ class WorkQueue:
             return await future
         except TimeoutError:
             await interaction.followup.send(
-                "That action timed out. Check /birthday me before retrying a save.", ephemeral=True
+                "That action timed out. Open /birthdaybot → My birthday before retrying a save.",
+                ephemeral=True,
             )
 
     async def worker(self):

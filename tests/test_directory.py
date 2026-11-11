@@ -166,7 +166,7 @@ async def test_main_menu_navigation_does_not_requeue_itself(db):
     bot.queue.start()
     try:
         await next(b for b in view.children if b.label == "Set birthday").callback(interaction)
-        assert "Your birthday" in interaction.followup.send.call_args.args[0]
+        assert "Your birthday" in interaction.edit_original_response.call_args.kwargs["content"]
         assert not bot.queue.pending
     finally:
         await bot.queue.close()
@@ -205,3 +205,24 @@ async def test_v3_migration_keeps_records_and_defaults_to_public(tmp_path: Path)
         assert (await reopened.birthday(1, 10))["consent"] == 0
     finally:
         await reopened.close()
+
+
+async def test_public_calendar_queued_controls_work_for_a_different_member(db):
+    await seed(db)
+    bot, interaction = environment(db)
+    await open_directory(bot, interaction)
+    view = bot.directory_views[(1, 100)]
+    interaction.user.id = 21  # Calendar owner is 20; shared controls allow members.
+    assert await view.interaction_check(interaction)
+    bot.queue.start()
+    try:
+        await next(
+            item for item in view.children if getattr(item, "label", None) == "Monthly summary"
+        ).callback(interaction)
+        assert view.summary
+        assert (
+            interaction.edit_original_response.call_args.kwargs["embed"].title
+            == "📅 Birthdays by month"
+        )
+    finally:
+        await bot.queue.close()

@@ -44,11 +44,16 @@ def test_external_urls_rejected(url):
 def interaction(mod=False, user=10):
     value = MagicMock()
     value.guild = MagicMock()
+    value.guild_id = 1
     value.user = MagicMock(spec=discord.Member)
     value.user.id = user
     value.user.guild_permissions = discord.Permissions(manage_guild=mod)
     value.response.is_done.return_value = False
     value.response.send_message = AsyncMock()
+    value.response.defer = AsyncMock()
+    value.response.edit_message = AsyncMock()
+    value.edit_original_response = AsyncMock()
+    value.followup.send = AsyncMock()
     return value
 
 
@@ -70,30 +75,25 @@ async def test_private_menu_owner_and_revoked_moderator_access():
 
 async def test_actual_command_callbacks_reject_every_admin_action():
     bot = BirthdayBot(Config(token="test"))
-    admin = bot.tree.get_command("birthday-admin")
-    assert admin.default_permissions.manage_guild
-    for command in admin.commands:
-        assert command.checks, command.name
+    assert [command.name for command in bot.tree.get_commands()] == ["birthdaybot"]
+    assert not bot.tree.get_command("birthdaybot").parameters
+    assert bot.admin_actions == {
+        "tools",
+        "setup",
+        "records",
+        "forget",
+        "pause",
+        "preview",
+        "status",
+        "channel_deliveries",
+        "dm_deliveries",
+    }
+    for name in bot.admin_actions:
         with pytest.raises(app_commands.MissingPermissions):
-            for check in command.checks:
-                check(interaction())
+            await bot.menu_actions[name](interaction())
     assert not bot.intents.members
     assert not bot.intents.message_content
     assert not bot.intents.presences
-    assert {c.name for c in bot.tree.get_command("birthday").commands} == {
-        "set",
-        "update",
-        "me",
-        "delete",
-        "help",
-        "list",
-        "summary",
-    }
-    assert not bot.tree.get_command("birthday").get_command("me").parameters
-    for name in ("set", "update"):
-        params = bot.tree.get_command("birthday").get_command(name).parameters
-        assert [p.name for p in params] == ["opt_out", "timezone"]
-        assert not any(p.required for p in params)
 
 
 async def test_menus_fit_discord_limits_and_preserve_opt_out(db):
@@ -160,7 +160,7 @@ def test_gif_url_canonicalizes_markup_and_cannot_break_a_link():
     assert not any(char in value for char in "[]()`<>")
 
 
-async def test_time_and_gif_are_menu_forms_with_save_and_validation(db):
+async def test_time_selectors_and_gif_form_save_and_validate(db):
     from birthdaybot.work_queue import WorkQueue
 
     queue = WorkQueue()
@@ -172,36 +172,48 @@ async def test_time_and_gif_are_menu_forms_with_save_and_validation(db):
     value.response.is_done.return_value = False
     value.edit_original_response = AsyncMock()
 
-    # These select options must open a modal as the initial response; deferring
-    # them through the queue would produce InteractionResponded on Discord.
-    menu = view.children[0]
-    menu._values = ["time"]
-    await menu.callback(value)
-    modal = value.response.send_modal.call_args.args[0]
-    assert modal.inputs["time"].default == "00:00"
-    await modal.submit(value, {"time": "18:45"})
-    assert (await db.guild(1))["hour"] == 0  # Draft only until Save.
-    assert (view.hour, view.minute) == (18, 45)
-    await view.reset_midnight(value)
-    assert (view.hour, view.minute) == (0, 0)
+    queue.start()
+    try:
 
-    menu = view.children[0]
-    menu._values = ["gif"]
-    await menu.callback(value)
-    modal = value.response.send_modal.call_args.args[0]
-    with pytest.raises(ValueError):
-        await modal.submit(value, {"gif": "https://evil.example/image.gif"})
-    assert view.gif == ""
-    await modal.submit(value, {"gif": "https://static.klipy.com/birthday(cake).gif"})
-    assert view.gif == "https://static.klipy.com/birthday%28cake%29.gif"
-    assert f"[Open GIF]({view.gif})" in view.content()
-    assert (await db.guild(1))["gif"] == ""
+        async def select(row, choice):
+            menu = next(
+                item
+                for item in view.children
+                if isinstance(item, discord.ui.Select) and item.row == row
+            )
+            menu._values = [choice]
+            await menu.callback(value)
 
-    # A custom time can still be selected after using the midnight preset.
-    await view.edit_time(value)
-    modal = value.response.send_modal.call_args.args[0]
-    await modal.submit(value, {"time": "18:45"})
-    value.response.is_done.return_value = True
-    await view.save(value)
-    saved = await db.guild(1)
-    assert (saved["hour"], saved["minute"], saved["gif"]) == (18, 45, view.gif)
+        await select(0, "time")
+        value.response.send_modal.assert_not_awaited()
+        assert len(view.to_components()) == 5
+        await select(1, "18")
+        await select(2, "2")
+        await select(3, "45")
+        assert (await db.guild(1))["hour"] == 0  # Draft only until Save.
+        assert (view.hour, view.minute) == (18, 45)
+        await view.reset_midnight(value)
+        assert (view.hour, view.minute) == (0, 0)
+
+        # GIF is one of the two necessary text inputs. It must open as the
+        # initial response, before the queue can defer the interaction.
+        await select(0, "gif")
+        modal = value.response.send_modal.call_args.args[0]
+        with pytest.raises(ValueError):
+            await modal.submit(value, {"gif": "https://evil.example/image.gif"})
+        assert view.gif == ""
+        await modal.submit(value, {"gif": "https://static.klipy.com/birthday(cake).gif"})
+        assert view.gif == "https://static.klipy.com/birthday%28cake%29.gif"
+        assert f"[Open GIF]({view.gif})" in view.content()
+        assert (await db.guild(1))["gif"] == ""
+
+        await select(0, "time")
+        await select(1, "18")
+        await select(2, "2")
+        await select(3, "45")
+        value.response.is_done.return_value = True
+        await view.save(value)
+        saved = await db.guild(1)
+        assert (saved["hour"], saved["minute"], saved["gif"]) == (18, 45, view.gif)
+    finally:
+        await queue.close()

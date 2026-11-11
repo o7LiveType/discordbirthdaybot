@@ -62,6 +62,8 @@ class DirectoryView(OwnedView):
             )
         )
         self.add_item(button("Refresh", self.refresh, row=2))
+        if not self.public:
+            self.add_item(button("Main menu", self.bot.menu_actions["home"], row=3))
 
     async def interaction_check(self, interaction):
         if not self.public:

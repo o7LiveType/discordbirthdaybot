@@ -1,22 +1,60 @@
 """Calendar rules. Birth years are never requested or stored."""
 
 import calendar
+import re
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 ZONES = sorted(available_timezones() - {"localtime", "posixrules"})
+ZONE_KEYS = {zone.casefold(): zone for zone in ZONES}
 LEAP_POLICIES = {"feb28", "mar1", "leap_only"}
 
 
+def timezone_query(value: str) -> str:
+    # Accept only timezone/city characters; never echo untrusted input into Markdown.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_+ /-]{1,80}", value):
+        raise ValueError(
+            "Invalid timezone. Enter a city or IANA name using letters, spaces, /, _, + or -."
+        )
+    value = re.sub(" +", "_", value.strip(" "))
+    if not value:
+        raise ValueError("Enter a city or IANA timezone, for example New York or Europe/London.")
+    return value
+
+
 def timezone(value: str) -> str:
-    value = value.strip()
-    if value not in ZONES:
+    value = ZONE_KEYS.get(timezone_query(value).casefold())
+    if value is None:
         raise ValueError("Choose an IANA timezone, for example America/New_York or Europe/London.")
     try:
         ZoneInfo(value)
     except (ValueError, ZoneInfoNotFoundError) as exc:
         raise ValueError("That timezone is unavailable on this host.") from exc
     return value
+
+
+def find_timezones(value: str) -> list[str]:
+    query = timezone_query(value).casefold()
+    if query in ZONE_KEYS:
+        return [timezone(ZONE_KEYS[query])]
+    needle = query.replace("_", "")
+    matches = [zone for zone in ZONES if needle in zone.casefold().replace("_", "")]
+    if not matches:
+        raise ValueError("Timezone not found. Try a nearby major city or a full IANA name.")
+    if len(matches) > 24:
+        raise ValueError(
+            "Too many timezone matches. Enter a more specific city or a full IANA name."
+        )
+    return matches
+
+
+def timezone_label(zone: str, now: datetime | None = None) -> str:
+    zone = timezone(zone)
+    offset = (now or datetime.now(UTC)).astimezone(ZoneInfo(zone)).utcoffset()
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, minutes = divmod(abs(minutes), 60)
+    return f"{zone} · UTC{sign}{hours:02}:{minutes:02} now"
 
 
 def clock(value: str) -> tuple[int, int]:

@@ -1,15 +1,16 @@
+"""One slash launcher; all member and moderator actions live in private menus."""
+
 import calendar
+import functools
 import logging
-from datetime import UTC, datetime
-from typing import Literal
+from datetime import UTC, datetime, timedelta
 
 import discord
 from discord import app_commands
 
 from .delivery import celebration, channel_issues
 from .directory import open_directory
-from .timeutil import ZONES
-from .timeutil import timezone as valid_timezone
+from .timeutil import timezone_label
 from .ui import (
     BirthdayWizard,
     Confirm,
@@ -17,7 +18,9 @@ from .ui import (
     SettingsWizard,
     button,
     defer,
+    edit,
     moderator,
+    navigation,
     private,
 )
 from .work_queue import queued
@@ -31,12 +34,25 @@ def require_mod(interaction):
     return True
 
 
+async def show(bot, interaction, content, view, *, embed=None):
+    bot.track_view(view, interaction.guild_id, interaction.user.id)
+    await defer(interaction)
+    await edit(
+        interaction,
+        content=content,
+        embed=embed,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 class PrivateList(OwnedView):
     def __init__(self, bot, owner, guild_id):
         super().__init__(owner, admin=True, queue=bot.queue)
         self.bot, self.guild_id, self.page = bot, guild_id, 0
         self.add_item(button("Previous", self.previous))
         self.add_item(button("Next", self.next))
+        self.add_item(button("Server tools", bot.menu_actions["tools"]))
 
     async def render(self):
         # Requery on every click: don't retain deleted private records in menus.
@@ -77,252 +93,471 @@ class PrivateList(OwnedView):
         )
 
 
-def install(bot):
-    birthday = app_commands.Group(
-        name="birthday",
-        description="Browse server birthdays or manage your own birthday",
-        guild_only=True,
-        allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
-    )
-    admin = app_commands.Group(
-        name="birthday-admin",
-        description="Moderate private birthday records and configure celebrations",
-        guild_only=True,
-        default_permissions=discord.Permissions(manage_guild=True),
-        allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
-    )
+class DeliveryList(OwnedView):
+    def __init__(self, bot, owner, guild_id, kind):
+        super().__init__(owner, admin=True, queue=bot.queue)
+        self.bot, self.guild_id, self.kind = bot, guild_id, kind
+        self.page = 0
 
-    async def open_member(interaction, timezone, opt_out, *, update):
-        zone = valid_timezone(timezone) if timezone else None
+    @property
+    def table(self):
+        return "dm_deliveries" if self.kind == "dm" else "deliveries"
+
+    async def render(self):
+        rows = await self.bot.db.read(
+            f"SELECT * FROM {self.table} WHERE guild_id=? AND state NOT IN ('sent','skipped','blocked') ORDER BY created_at DESC,marker LIMIT 11 OFFSET ?",  # noqa: S608 - fixed table choices
+            (self.guild_id, self.page * 10),
+        )
+        if not rows and self.page:
+            self.page = 0
+            return await self.render()
+        self.clear_items()
+        if rows:
+            select = discord.ui.Select(
+                placeholder="Review a delivery",
+                row=0,
+                options=[
+                    discord.SelectOption(
+                        label=f"{index + 1}. {row['year']} · {row['state']}",
+                        description=f"Member ID {row['user_id']}",
+                        value=row["marker"],
+                    )
+                    for index, row in enumerate(rows[:10])
+                ],
+            )
+
+            async def choose(interaction):
+                view = DeliveryReview(
+                    self.bot, self.owner, self.guild_id, self.kind, select.values[0]
+                )
+                await show(self.bot, interaction, await view.render(), view)
+
+            select.callback = choose
+            self.add_item(select)
+        self.add_item(button("Previous", self.previous, disabled=self.page == 0))
+        self.add_item(button("Next", self.next, disabled=len(rows) <= 10))
+        self.add_item(button("Refresh", self.refresh))
+        self.add_item(button("Server tools", self.bot.menu_actions["tools"]))
+        lines = [
+            f"**{index + 1}.** <@{row['user_id']}> · {row['year']} · {row['state']}"
+            for index, row in enumerate(rows[:10])
+        ]
+        return (
+            f"**{self.kind.title()} deliveries needing attention** · page {self.page + 1}\n"
+            + ("\n".join(lines) or "None.")
+            + "\nChoose a delivery to review it."
+        )
+
+    async def refresh(self, interaction):
+        await edit(interaction, content=await self.render(), view=self)
+
+    async def previous(self, interaction):
+        self.page = max(0, self.page - 1)
+        await self.refresh(interaction)
+
+    async def next(self, interaction):
+        self.page += 1
+        await self.refresh(interaction)
+
+
+class DeliveryReview(OwnedView):
+    def __init__(self, bot, owner, guild_id, kind, marker):
+        super().__init__(owner, admin=True, queue=bot.queue)
+        self.bot, self.guild_id, self.kind, self.marker = bot, guild_id, kind, marker
+        self.before = None
+        self.add_item(button("Find posted message", self.find))
+        self.add_item(button("Retry or skip…", self.decide))
+        self.add_item(button("Back to deliveries", self.back))
+
+    async def job(self):
+        table = "dm_deliveries" if self.kind == "dm" else "deliveries"
+        rows = await self.bot.db.read(
+            f"SELECT * FROM {table} WHERE guild_id=? AND marker=?",  # noqa: S608 - fixed table choices
+            (self.guild_id, self.marker),
+        )
+        return rows[0] if rows else None
+
+    async def render(self):
+        job = await self.job()
+        if not job:
+            return "This delivery no longer exists. Return to deliveries."
+        location = (
+            "Recipient DM (only delivery metadata is shown)"
+            if self.kind == "dm"
+            else f"<#{job['channel_id']}>"
+        )
+        error = discord.utils.escape_markdown((job["error"] or "Queued")[:150])
+        return f"**Review {self.kind} delivery**\nMember: <@{job['user_id']}> · {job['year']}\nState: **{job['state']}**\nOriginal location: {location}\nMarker: `{job['marker']}`\nStatus: {error}\nSearch for the bot's matching message first. Retry can duplicate an existing greeting."
+
+    async def back(self, interaction):
+        await self.bot.menu_actions[f"{self.kind}_deliveries"](interaction)
+
+    async def find(self, interaction):
+        require_mod(interaction)
+        job = await self.job()
+        if not job or job["state"] not in {"sending", "uncertain", "retry"}:
+            await private(
+                interaction, "This delivery is no longer awaiting resolution. Refresh the list."
+            )
+            return
+        if not job["channel_id"]:
+            await private(
+                interaction,
+                "No original message channel was recorded. Review the delivery before retrying or skipping.",
+            )
+            return
+        channel = self.bot.get_partial_messageable(job["channel_id"])
+        footer = "Birthday DM" if self.kind == "dm" else "Birthday delivery"
+        count, oldest = 0, None
+        async for message in channel.history(
+            limit=500,
+            after=datetime.fromtimestamp(job["created_at"], UTC) - timedelta(seconds=5),
+            before=discord.Object(self.before) if self.before else None,
+            oldest_first=False,
+        ):
+            count += 1
+            oldest = message.id
+            if message.author.id == self.bot.user.id and any(
+                embed.footer.text == f"{footer} {self.marker}" for embed in message.embeds
+            ):
+                async with self.bot.mutation_lock:
+                    current = await self.job()
+                    if not current or current["state"] not in {"sending", "uncertain", "retry"}:
+                        await private(
+                            interaction,
+                            "This delivery changed during the search. Refresh the list.",
+                        )
+                        return
+                    confirm = (
+                        self.bot.scheduler.dms.confirm
+                        if self.kind == "dm"
+                        else self.bot.scheduler.confirm_sent
+                    )
+                    await confirm(current, message)
+                self.audit(interaction, current, "verified_sent")
+                await edit(
+                    interaction,
+                    content="✅ Verified the bot's matching message and marked it delivered. Its 24-hour deletion is scheduled.",
+                    view=navigation(self.bot, self.owner, self.guild_id, admin=True),
+                )
+                return
+        self.before = oldest if count == 500 else None
+        self.children[0].label = "Search older messages" if self.before else "Search again"
+        await edit(
+            interaction,
+            content=await self.render()
+            + (
+                "\nNo match in this batch of 500. Search older messages to continue."
+                if self.before
+                else "\nNo matching message found in the remaining history. A missing match alone does not prove the send failed."
+            ),
+            view=self,
+        )
+
+    async def decide(self, interaction):
+        require_mod(interaction)
+        job = await self.job()
+        if not job or job["state"] not in {"sending", "uncertain", "retry"}:
+            await private(
+                interaction, "This delivery is no longer awaiting resolution. Refresh the list."
+            )
+            return
+        view = OwnedView(self.owner, admin=True, queue=self.bot.queue)
+
+        async def retry(submission):
+            await self.resolve(submission, "retry")
+
+        async def skip(submission):
+            await self.resolve(submission, "skipped")
+
+        async def back(submission):
+            # Rebuild a fresh view; show() stops the previous view.
+            fresh = DeliveryReview(self.bot, self.owner, self.guild_id, self.kind, self.marker)
+            await show(self.bot, submission, await fresh.render(), fresh)
+
+        view.add_item(
+            button("Checked for duplicates — retry", retry, style=discord.ButtonStyle.danger)
+        )
+        view.add_item(button("Skip this greeting", skip))
+        view.add_item(button("Cancel", back))
+        await show(
+            self.bot,
+            interaction,
+            f"**Confirm delivery decision**\nMember: <@{job['user_id']}> · {job['year']}\nMarker: `{job['marker']}`\n"
+            + (
+                "Original location: recipient DM\n"
+                if self.kind == "dm"
+                else f"Original channel: <#{job['channel_id']}>\n"
+            )
+            + "Check for this marker before retrying. Retry can duplicate an existing greeting; it only sends during the member's local birthday while sharing and announcements are enabled. Skip leaves any existing message untouched.",
+            view,
+        )
+
+    async def resolve(self, interaction, state):
+        require_mod(interaction)
+        if state not in {"retry", "skipped"}:
+            raise ValueError("Invalid delivery decision.")
+        async with self.bot.mutation_lock:
+            job = await self.job()
+            if not job or job["state"] not in {"sending", "uncertain", "retry"}:
+                await private(interaction, "This delivery was already resolved. Refresh the list.")
+                return
+            change = self.bot.db.dm_state if self.kind == "dm" else self.bot.db.delivery_state
+            await change(job, state, error="Manually resolved by moderator")
+        self.audit(interaction, job, state)
+        await edit(
+            interaction,
+            content=f"✅ Delivery decision saved: {state}.",
+            view=navigation(self.bot, self.owner, self.guild_id, admin=True),
+        )
+
+    def audit(self, interaction, job, action):
+        log.info(
+            "delivery_resolved guild=%s user=%s year=%s actor=%s kind=%s action=%s",
+            self.guild_id,
+            job["user_id"],
+            job["year"],
+            interaction.user.id,
+            self.kind,
+            action,
+        )
+
+
+def install(bot):
+    bot.menu_actions = {}
+    bot.admin_actions = set()
+
+    def action(name, *, admin=False):
+        def register(callback):
+            @functools.wraps(callback)
+            async def guarded(interaction):
+                if admin:
+                    require_mod(interaction)
+                return await callback(interaction)
+
+            bot.menu_actions[name] = guarded
+            if admin:
+                bot.admin_actions.add(name)
+            return guarded
+
+        return register
+
+    async def result(interaction, content, *, admin=False, embed=None):
         await defer(interaction)
+        await interaction.edit_original_response(
+            content=content,
+            embed=embed,
+            view=navigation(bot, interaction.user.id, interaction.guild_id, admin=admin),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @action("home")
+    async def home(interaction):
+        view = OwnedView(interaction.user.id, queue=bot.queue)
+        actions = [
+            ("View birthdays", "directory", 0),
+            ("Monthly summary", "summary", 0),
+            ("Set birthday", "set", 1),
+            ("Update birthday", "update", 1),
+            ("My birthday", "me", 1),
+            ("Delete birthday", "delete", 2),
+        ]
+        if moderator(interaction):
+            actions.append(("Server tools", "tools", 2))
+        for label, name, row in actions:
+            view.add_item(button(label, bot.menu_actions[name], row=row))
+        await show(
+            bot,
+            interaction,
+            "**🎂 Birthday bot**\nBrowse the server calendar or manage your own birthday.",
+            view,
+        )
+
+    async def open_member(interaction, *, update):
         settings = await bot.db.guild(interaction.guild_id)
         record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
         if update and not record:
-            await private(interaction, "You haven't set a birthday yet. Use `/birthday set`.")
+            await result(
+                interaction, "You haven't set a birthday yet. Choose Set birthday in the main menu."
+            )
             return
         if not update and record:
-            await private(
-                interaction, "Your birthday is already saved. Use `/birthday update` to change it."
+            await result(
+                interaction,
+                "Your birthday is already saved. Choose Update birthday in the main menu.",
             )
             return
         view = BirthdayWizard(
-            bot, interaction.user.id, interaction.guild_id, settings, record, zone, opt_out, update
+            bot, interaction.user.id, interaction.guild_id, settings, record, update=update
         )
-        bot.track_view(view, interaction.guild_id, interaction.user.id)
-        await private(interaction, view.content(), view=view)
+        await show(bot, interaction, view.content(), view)
 
-    @birthday.command(name="set", description="Set your birthday with a simple private menu")
-    @app_commands.describe(
-        opt_out="Hide your date from public lists and stop birthday posts and DMs",
-        timezone="Optional: type a city to find your timezone",
-    )
-    @queued(bot)
-    async def set_birthday(
-        interaction: discord.Interaction, opt_out: bool | None = None, timezone: str | None = None
-    ):
-        await open_member(interaction, timezone, opt_out, update=False)
+    @action("set")
+    async def set_birthday(interaction):
+        await open_member(interaction, update=False)
 
-    @birthday.command(
-        name="update", description="Update your birthday, timezone or announcement opt-out"
-    )
-    @app_commands.describe(
-        opt_out="Hide your date and disable birthday posts/DMs (True), or share it (False)",
-        timezone="Optional: type a city to find your timezone",
-    )
-    @queued(bot)
-    async def update_birthday(
-        interaction: discord.Interaction, opt_out: bool | None = None, timezone: str | None = None
-    ):
-        await open_member(interaction, timezone, opt_out, update=True)
+    @action("update")
+    async def update_birthday(interaction):
+        await open_member(interaction, update=True)
 
-    async def zone_autocomplete(interaction: discord.Interaction, current: str):
-        needle = current.casefold().replace(" ", "_")
-        return [
-            app_commands.Choice(name=zone.replace("_", " "), value=zone)
-            for zone in ZONES
-            if needle in zone.casefold()
-        ][:25]
-
-    set_birthday.autocomplete("timezone")(zone_autocomplete)
-    update_birthday.autocomplete("timezone")(zone_autocomplete)
-
-    @birthday.command(name="me", description="See your own saved birthday and timezone privately")
-    @queued(bot)
-    async def me(interaction: discord.Interaction):
-        await defer(interaction)
+    @action("me")
+    async def me(interaction):
         record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
         if not record:
-            await private(interaction, "You have no birthday saved here. Use `/birthday set`.")
+            await result(
+                interaction,
+                "You have no birthday saved here. Choose Set birthday in the main menu.",
+            )
             return
-        await private(
+        await result(
             interaction,
-            f"🎂 Your birthday: **{calendar.month_name[record['month']]} {record['day']}**\n"
-            f"Timezone: **{record['timezone']}**\n"
-            "Use `/birthday update` to change it or `/birthday delete` to remove it.",
+            f"🎂 Your birthday: **{calendar.month_name[record['month']]} {record['day']}**\nTimezone: **{timezone_label(record['timezone'])}**\nSharing: **{'ON' if record['consent'] else 'OFF (opted out)'}**\nUse the main menu to update or delete it.",
         )
 
-    @birthday.command(name="list", description="Browse server birthdays in calendar order")
-    @queued(bot)
-    async def directory(interaction: discord.Interaction):
+    @action("directory")
+    async def directory(interaction):
         await open_directory(bot, interaction)
 
-    @birthday.command(
-        name="summary", description="See the server's birthday total and monthly summary"
-    )
-    @queued(bot)
-    async def monthly_summary(interaction: discord.Interaction):
+    @action("summary")
+    async def summary(interaction):
         await open_directory(bot, interaction, summary=True)
 
-    @birthday.command(
-        name="delete", description="Delete your birthday and delivery metadata from this server"
-    )
-    @queued(bot)
-    async def delete(interaction: discord.Interaction):
-        async def action(submission):
+    async def confirm_delete(interaction, member_id, *, admin=False):
+        async def remove(submission):
+            if admin:
+                require_mod(submission)
             async with bot.mutation_lock:
-                await bot.db.forget(submission.guild_id, submission.user.id)
-            log.info(
-                "birthday_deleted guild=%s user=%s actor=self",
-                submission.guild_id,
-                submission.user.id,
-            )
-
-        await private(
-            interaction,
-            "Delete your birthday and delivery metadata from this server? "
-            "This removes your saved birthday in this server. Existing messages and operator backups are unaffected.",
-            view=bot.track_view(
-                Confirm(interaction.user.id, action, queue=bot.queue),
-                interaction.guild_id,
-                interaction.user.id,
-            ),
-            ephemeral=True,
-        )
-
-    @birthday.command(name="help", description="How to save, change or remove your birthday")
-    @queued(bot)
-    async def help_command(interaction: discord.Interaction):
-        await private(
-            interaction,
-            "🎂 **Set your birthday**\n"
-            "`/birthdaybot` → open the main menu.\n"
-            "`/birthday list` → birthdays in calendar order.\n"
-            "`/birthday summary` → monthly totals.\n"
-            "`/birthday set` → choose your day, month and timezone. That's it!\n"
-            "`/birthday update` → change those details.\n"
-            "`/birthday me` → check what you saved.\n"
-            "`/birthday delete` → remove it.\n\n"
-            "Press Save to confirm. Opting out hides your date and stops birthday announcements and DMs. "
-            "Servers can restrict birthday browsing to moderators. Timezones stay private; no birth year is collected.",
-        )
-
-    @admin.command(
-        name="setup",
-        description="Choose channels, announcement time, leap-day behavior and celebration GIF",
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def setup(interaction: discord.Interaction):
-        await defer(interaction)
-        settings = await bot.db.guild(interaction.guild_id)
-        view = SettingsWizard(bot, interaction.user.id, settings)
-        bot.track_view(view, interaction.guild_id, interaction.user.id)
-        await interaction.followup.send(view.content(), view=view, ephemeral=True)
-
-    @admin.command(
-        name="list", description="Privately list this server's birthday records (moderators only)"
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def list_birthdays(interaction: discord.Interaction):
-        await defer(interaction)
-        view = PrivateList(bot, interaction.user.id, interaction.guild_id)
-        bot.track_view(view, interaction.guild_id, interaction.user.id)
-        await interaction.followup.send(
-            await view.render(),
-            view=view,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        log.info("birthdays_listed guild=%s actor=%s", interaction.guild_id, interaction.user.id)
-
-    @admin.command(
-        name="forget", description="Delete a member's record from this server after confirmation"
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def forget(interaction: discord.Interaction, member: discord.Member):
-        async def action(submission):
-            async with bot.mutation_lock:
-                await bot.db.forget(submission.guild_id, member.id)
+                await bot.db.forget(submission.guild_id, member_id)
             log.info(
                 "birthday_deleted guild=%s user=%s actor=%s",
                 submission.guild_id,
-                member.id,
+                member_id,
                 submission.user.id,
             )
 
-        await private(
+        view = Confirm(interaction.user.id, remove, admin=admin, queue=bot.queue, bot=bot)
+        await show(
+            bot,
             interaction,
-            f"Delete the stored record for <@{member.id}>? Existing messages and backups remain.",
-            view=bot.track_view(
-                Confirm(interaction.user.id, action, admin=True, queue=bot.queue),
-                interaction.guild_id,
-                interaction.user.id,
-            ),
-            allowed_mentions=discord.AllowedMentions.none(),
+            f"Delete the stored birthday for <@{member_id}> in this server? Existing messages and operator backups follow their normal retention.",
+            view,
         )
 
-    @admin.command(
-        name="pause", description="Pause or resume all birthday announcements for this server"
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def pause(interaction: discord.Interaction, paused: bool):
-        await defer(interaction)
-        async with bot.mutation_lock:
-            await bot.db.ensure_guild(interaction.guild_id)
-            await bot.db.pause(interaction.guild_id, paused)
-        await private(
+    @action("delete")
+    async def delete(interaction):
+        await confirm_delete(interaction, interaction.user.id)
+
+    @action("tools", admin=True)
+    async def tools(interaction):
+        view = OwnedView(interaction.user.id, admin=True, queue=bot.queue)
+        actions = [
+            ("Server settings", "setup", 0),
+            ("All birthday records", "records", 0),
+            ("Delete member birthday", "forget", 0),
+            ("Preview", "preview", 1),
+            ("Status", "status", 1),
+            ("Pause / resume", "pause", 1),
+            ("Channel deliveries", "channel_deliveries", 2),
+            ("DM deliveries", "dm_deliveries", 2),
+            ("Main menu", "home", 3),
+        ]
+        for label, name, row in actions:
+            view.add_item(button(label, bot.menu_actions[name], row=row))
+        await show(
+            bot,
             interaction,
-            "Announcements paused."
-            if paused
-            else "Announcements resumed. Today's due birthdays may catch up.",
-        )
-        log.info(
-            "announcements_paused guild=%s actor=%s paused=%s",
-            interaction.guild_id,
-            interaction.user.id,
-            paused,
+            "**Server tools**\nManage Server permission is required for every action.",
+            view,
         )
 
-    @admin.command(
-        name="preview",
-        description="Privately preview the birthday embed and check channel permissions",
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def preview(interaction: discord.Interaction):
-        await defer(interaction)
+    @action("setup", admin=True)
+    async def setup(interaction):
+        view = SettingsWizard(bot, interaction.user.id, await bot.db.guild(interaction.guild_id))
+        await show(bot, interaction, view.content(), view)
+
+    @action("records", admin=True)
+    async def records(interaction):
+        view = PrivateList(bot, interaction.user.id, interaction.guild_id)
+        await show(bot, interaction, await view.render(), view)
+        log.info("birthdays_listed guild=%s actor=%s", interaction.guild_id, interaction.user.id)
+
+    @action("forget", admin=True)
+    async def forget(interaction):
+        view = OwnedView(interaction.user.id, admin=True, queue=bot.queue)
+        members = discord.ui.UserSelect(
+            placeholder="Choose the member whose birthday to delete", row=0
+        )
+
+        async def choose(submission):
+            require_mod(submission)
+            await confirm_delete(submission, members.values[0].id, admin=True)
+
+        members.callback = choose
+        view.add_item(members)
+        view.add_item(button("Server tools", bot.menu_actions["tools"]))
+        await show(
+            bot,
+            interaction,
+            "**Delete a member's birthday**\nChoose a member, then confirm deletion.",
+            view,
+        )
+
+    @action("pause", admin=True)
+    async def pause(interaction):
+        settings = await bot.db.guild(interaction.guild_id)
+        view = OwnedView(interaction.user.id, admin=True, queue=bot.queue)
+
+        async def change(submission, paused):
+            require_mod(submission)
+            async with bot.mutation_lock:
+                await bot.db.ensure_guild(submission.guild_id)
+                await bot.db.pause(submission.guild_id, paused)
+            await result(
+                submission,
+                "Announcements and birthday DMs paused."
+                if paused
+                else "Announcements and birthday DMs resumed. Today's due birthdays may catch up.",
+                admin=True,
+            )
+            log.info(
+                "announcements_paused guild=%s actor=%s paused=%s",
+                submission.guild_id,
+                submission.user.id,
+                paused,
+            )
+
+        async def stop(submission):
+            await change(submission, True)
+
+        async def resume(submission):
+            await change(submission, False)
+
+        view.add_item(button("Pause", stop))
+        view.add_item(button("Resume", resume))
+        view.add_item(button("Server tools", bot.menu_actions["tools"]))
+        await show(
+            bot,
+            interaction,
+            f"Announcements and birthday DMs are **{'enabled' if settings['enabled'] else 'paused'}**.",
+            view,
+        )
+
+    @action("preview", admin=True)
+    async def preview(interaction):
         settings = await bot.db.guild(interaction.guild_id)
         issues = channel_issues(
             interaction.guild.get_channel(settings["channel_id"] or 0), interaction.guild
         )
-        await interaction.followup.send(
+        await result(
+            interaction,
             "Preview only. " + (" ".join(issues) if issues else "Channel permissions OK."),
+            admin=True,
             embed=celebration(
                 interaction.user.id, settings["gif"] or bot.config.gif, "", preview=True
             ),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @admin.command(
-        name="status",
-        description="Inspect scheduler health, configuration, SQLite durability and delivery counts",
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
+    @action("status", admin=True)
     async def status(interaction: discord.Interaction):
         await defer(interaction)
         settings = await bot.db.guild(interaction.guild_id)
@@ -345,7 +580,7 @@ def install(bot):
             if last
             else "not yet completed"
         )
-        await private(
+        await result(
             interaction,
             f"**Birthday bot health**\nScheduler last success: {age}\nPoll interval: {bot.config.poll_seconds}s\n"
             f"Gateway latency: {bot.latency * 1000:.0f}ms\nSQLite: {mode.upper()}, synchronous={'FULL' if sync == 2 else sync}\n"
@@ -359,142 +594,24 @@ def install(bot):
             + (", ".join(f"{r['state']}={r['n']}" for r in dm_counts) or "none")
             + "\nChecks: "
             + (" ".join(issues) if issues else "channel permissions OK"),
+            admin=True,
         )
 
-    @admin.command(
-        name="deliveries", description="Inspect recent failed or uncertain birthday deliveries"
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def deliveries(
-        interaction: discord.Interaction, kind: Literal["channel", "dm"] = "channel"
-    ):
-        await defer(interaction)
-        table = "dm_deliveries" if kind == "dm" else "deliveries"
-        rows = await bot.db.read(
-            f"SELECT * FROM {table} WHERE guild_id=? AND state NOT IN ('sent','skipped','blocked') ORDER BY created_at DESC LIMIT 10",  # noqa: S608 - table from fixed choices
-            (interaction.guild_id,),
-        )
-        await private(
-            interaction,
-            f"**{kind.title()} deliveries needing attention**\n"
-            + (
-                "\n".join(
-                    f"<@{r['user_id']}> · {r['year']} · {r['state']} · marker `{r['marker']}` · {(r['error'] or 'queued')[:80]}"
-                    for r in rows
-                )
-                or "None."
-            )
-            + "\nResolve uncertain sends only after checking the channel for their marker.",
-        )
+    @action("channel_deliveries", admin=True)
+    async def channel_deliveries(interaction):
+        view = DeliveryList(bot, interaction.user.id, interaction.guild_id, "channel")
+        await show(bot, interaction, await view.render(), view)
 
-    @admin.command(
-        name="resolve",
-        description="Resolve an uncertain send after manually checking the channel for duplicates",
-    )
-    @app_commands.check(require_mod)
-    @queued(bot)
-    async def resolve(
-        interaction: discord.Interaction,
-        member: discord.Member,
-        year: app_commands.Range[int, 2020, 2200],
-        action: Literal["mark_delivered", "retry", "skip"],
-        checked_channel: bool,
-        message_id: str | None = None,
-        kind: Literal["channel", "dm"] = "channel",
-    ):
-        if not checked_channel:
-            await private(
-                interaction,
-                "Check the delivery's original channel and marker first, then set checked_channel to True.",
-            )
-            return
-        await defer(interaction)
-        async with bot.mutation_lock:
-            table = "dm_deliveries" if kind == "dm" else "deliveries"
-            rows = await bot.db.read(
-                f"SELECT * FROM {table} WHERE guild_id=? AND user_id=? AND year=? AND state IN ('uncertain','sending','retry')",  # noqa: S608 - table from fixed choices
-                (interaction.guild_id, member.id, year),
-            )
-            if not rows:
-                await private(interaction, "No unresolved delivery matches that member and year.")
-                return
-            state = {"mark_delivered": "sent", "retry": "retry", "skip": "skipped"}[action]
-            footer = "Birthday DM" if kind == "dm" else "Birthday delivery"
-            if state == "sent":
-                if not message_id or not message_id.isdecimal():
-                    await private(
-                        interaction,
-                        "Provide the birthday post's message_id so I can verify it and delete it after 24 hours.",
-                    )
-                    return
-                channel = bot.get_partial_messageable(rows[0]["channel_id"])
-                message = await channel.fetch_message(int(message_id))
-                if message.author.id != bot.user.id or not any(
-                    e.footer.text == f"{footer} {rows[0]['marker']}" for e in message.embeds
-                ):
-                    await private(
-                        interaction,
-                        "That message does not match this delivery's author and marker.",
-                    )
-                    return
-                if kind == "dm":
-                    await bot.scheduler.dms.confirm(rows[0], message)
-                else:
-                    await bot.scheduler.confirm_sent(rows[0], message)
-            else:
-                change_state = bot.db.dm_state if kind == "dm" else bot.db.delivery_state
-                await change_state(rows[0], state, error="Manually resolved by moderator")
-        log.info(
-            "delivery_resolved guild=%s user=%s year=%s actor=%s action=%s",
-            interaction.guild_id,
-            member.id,
-            year,
-            interaction.user.id,
-            action,
-        )
-        await private(
-            interaction,
-            f"Delivery resolved: {state}. Retries only send if it is still the user's local birthday and celebration is enabled.",
-        )
+    @action("dm_deliveries", admin=True)
+    async def dm_deliveries(interaction):
+        view = DeliveryList(bot, interaction.user.id, interaction.guild_id, "dm")
+        await show(bot, interaction, await view.render(), view)
 
     @app_commands.command(name="birthdaybot", description="Open the birthday bot menu")
     @app_commands.guild_only()
     @app_commands.allowed_installs(guilds=True, users=False)
     @queued(bot)
     async def main_menu(interaction: discord.Interaction):
-        view = OwnedView(interaction.user.id, queue=bot.queue)
-        actions = [
-            ("View birthdays", directory, 0),
-            ("Monthly summary", monthly_summary, 0),
-            ("Set birthday", set_birthday, 1),
-            ("Update birthday", update_birthday, 1),
-            ("My birthday", me, 1),
-            ("Delete birthday", delete, 2),
-        ]
-        if moderator(interaction):
-            actions.append(("Server setup", setup, 2))
-        for label, command, row in actions:
-
-            def callback_for(target):
-                async def navigate(submission):
-                    if target is setup and not moderator(submission):
-                        await private(
-                            submission, "You need Manage Server permission for server setup."
-                        )
-                        return
-                    await target.callback.__wrapped__(submission)
-
-                return navigate
-
-            view.add_item(button(label, callback_for(command), row=row))
-        bot.track_view(view, interaction.guild_id, interaction.user.id)
-        await private(
-            interaction,
-            "**🎂 Birthday bot**\nBrowse the server calendar or manage your own birthday.",
-            view=view,
-        )
+        await bot.menu_actions["home"](interaction)
 
     bot.tree.add_command(main_menu)
-    bot.tree.add_command(birthday)
-    bot.tree.add_command(admin)

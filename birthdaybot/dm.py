@@ -176,7 +176,7 @@ class BirthdayDMs:
         await self.alert(
             settings,
             "dm_uncertain",
-            "A birthday DM needs review to avoid duplicates. Use /birthday-admin deliveries with kind: dm.",
+            "A birthday DM needs review to avoid duplicates. Open /birthdaybot → Server tools → DM deliveries.",
         )
 
     async def confirm(self, job, message, now=None):
