@@ -90,7 +90,22 @@ class BirthdayBot(discord.AutoShardedClient):
         self.live_clock = True
         self.queue = WorkQueue()
         self.active_views = OrderedDict()
+        self.directory_views = OrderedDict()
+        self.directory_refreshes = OrderedDict()
         install(self)
+
+    def track_directory(self, view, guild_id, channel_id):
+        key = (guild_id, channel_id)
+        previous = self.directory_views.pop(key, None)
+        if previous:
+            previous.stop()
+        self.directory_views[key] = view
+        self.directory_refreshes.pop(key, None)
+        self.directory_refreshes[key] = time.monotonic()
+        if len(self.directory_views) > 1000:
+            old_key, oldest = self.directory_views.popitem(last=False)
+            oldest.stop()
+            self.directory_refreshes.pop(old_key, None)
 
     def track_view(self, view, guild_id, user_id):
         key = (guild_id, user_id)
@@ -142,6 +157,10 @@ class BirthdayBot(discord.AutoShardedClient):
             for view in self.active_views.values():
                 view.stop()
             self.active_views.clear()
+            for view in self.directory_views.values():
+                view.stop()
+            self.directory_views.clear()
+            self.directory_refreshes.clear()
             await super().close()
             if self.db_open:
                 await self.db.close()

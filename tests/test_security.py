@@ -78,6 +78,8 @@ async def test_actual_command_callbacks_reject_every_admin_action():
         "me",
         "delete",
         "help",
+        "list",
+        "summary",
     }
     assert not bot.tree.get_command("birthday").get_command("me").parameters
     for name in ("set", "update"):
@@ -97,7 +99,7 @@ async def test_menus_fit_discord_limits_and_preserve_opt_out(db):
         if isinstance(component, discord.ui.Select):
             assert len(component.options) <= 25
     admin_view = SettingsWizard(MagicMock(), 10, settings)
-    assert len(admin_view.to_components()) == 4
+    assert len(admin_view.to_components()) == 5
     modal = FieldsModal("Test", [("zone", "Timezone", "UTC")], AsyncMock(), 10)
     assert modal.to_components()[0]["type"] == 18  # Modern Label, not a legacy ActionRow.
 

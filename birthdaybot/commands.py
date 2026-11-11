@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 
 from .delivery import celebration, channel_issues
+from .directory import open_directory
 from .timeutil import ZONES
 from .timeutil import timezone as valid_timezone
 from .ui import (
@@ -79,7 +80,7 @@ class PrivateList(OwnedView):
 def install(bot):
     birthday = app_commands.Group(
         name="birthday",
-        description="Your private birthday and celebration preferences",
+        description="Browse server birthdays or manage your own birthday",
         guild_only=True,
         allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
     )
@@ -112,7 +113,7 @@ def install(bot):
 
     @birthday.command(name="set", description="Set your birthday with a simple private menu")
     @app_commands.describe(
-        opt_out="Save privately without a public birthday announcement",
+        opt_out="Hide your birthday from public lists and announcements",
         timezone="Optional: type a city to find your timezone",
     )
     @queued(bot)
@@ -125,7 +126,7 @@ def install(bot):
         name="update", description="Update your birthday, timezone or announcement opt-out"
     )
     @app_commands.describe(
-        opt_out="Turn birthday announcements off (True) or on (False)",
+        opt_out="Hide your birthday from public lists and announcements (True), or share it (False)",
         timezone="Optional: type a city to find your timezone",
     )
     @queued(bot)
@@ -160,6 +161,18 @@ def install(bot):
             "Use `/birthday update` to change it or `/birthday delete` to remove it.",
         )
 
+    @birthday.command(name="list", description="Browse server birthdays in calendar order")
+    @queued(bot)
+    async def directory(interaction: discord.Interaction):
+        await open_directory(bot, interaction)
+
+    @birthday.command(
+        name="summary", description="See the server's birthday total and monthly summary"
+    )
+    @queued(bot)
+    async def monthly_summary(interaction: discord.Interaction):
+        await open_directory(bot, interaction, summary=True)
+
     @birthday.command(
         name="delete", description="Delete your birthday and delivery metadata from this server"
     )
@@ -192,12 +205,15 @@ def install(bot):
         await private(
             interaction,
             "🎂 **Set your birthday**\n"
+            "`/birthdaybot` → open the main menu.\n"
+            "`/birthday list` → birthdays in calendar order.\n"
+            "`/birthday summary` → monthly totals.\n"
             "`/birthday set` → choose your day, month and timezone. That's it!\n"
             "`/birthday update` → change those details.\n"
             "`/birthday me` → check what you saved.\n"
             "`/birthday delete` → remove it.\n\n"
-            "Press Save to confirm. Announcements are optional: use the opt_out flag or toggle them off in the menu. Only you and Manage Server moderators "
-            "can view the saved record. No birth year is collected.",
+            "Press Save to confirm. Opting out hides your date from public lists and announcements. "
+            "Servers can restrict birthday browsing to moderators. Timezones stay private; no birth year is collected.",
         )
 
     @admin.command(
@@ -330,6 +346,7 @@ def install(bot):
             f"**Birthday bot health**\nScheduler last success: {age}\nPoll interval: {bot.config.poll_seconds}s\n"
             f"Gateway latency: {bot.latency * 1000:.0f}ms\nSQLite: {mode.upper()}, synchronous={'FULL' if sync == 2 else sync}\n"
             f"Announcements: {'enabled' if settings['enabled'] else 'PAUSED'}\n"
+            f"Birthday lists: {'public' if settings['public_birthdays'] else 'moderators only'}\n"
             f"Channel: {settings['channel_id'] or 'NOT SET'}\nAlerts: {settings['alert_channel_id'] or 'logs only'}\n"
             f"GIF configured: {bool(settings['gif'] or bot.config.gif)}\n"
             "Deliveries: "
@@ -426,5 +443,43 @@ def install(bot):
             f"Delivery resolved: {state}. Retries only send if it is still the user's local birthday and celebration is enabled.",
         )
 
+    @app_commands.command(name="birthdaybot", description="Open the birthday bot menu")
+    @app_commands.guild_only()
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @queued(bot)
+    async def main_menu(interaction: discord.Interaction):
+        view = OwnedView(interaction.user.id, queue=bot.queue)
+        actions = [
+            ("View birthdays", directory, 0),
+            ("Monthly summary", monthly_summary, 0),
+            ("Set birthday", set_birthday, 1),
+            ("Update birthday", update_birthday, 1),
+            ("My birthday", me, 1),
+            ("Delete birthday", delete, 2),
+        ]
+        if moderator(interaction):
+            actions.append(("Server setup", setup, 2))
+        for label, command, row in actions:
+
+            def callback_for(target):
+                async def navigate(submission):
+                    if target is setup and not moderator(submission):
+                        await private(
+                            submission, "You need Manage Server permission for server setup."
+                        )
+                        return
+                    await target.callback.__wrapped__(submission)
+
+                return navigate
+
+            view.add_item(button(label, callback_for(command), row=row))
+        bot.track_view(view, interaction.guild_id, interaction.user.id)
+        await private(
+            interaction,
+            "**🎂 Birthday bot**\nBrowse the server calendar or manage your own birthday.",
+            view=view,
+        )
+
+    bot.tree.add_command(main_menu)
     bot.tree.add_command(birthday)
     bot.tree.add_command(admin)

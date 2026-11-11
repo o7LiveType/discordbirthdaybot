@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS guilds (
  timezone TEXT NOT NULL DEFAULT 'UTC', hour INTEGER NOT NULL DEFAULT 9 CHECK(hour BETWEEN 0 AND 23),
  minute INTEGER NOT NULL DEFAULT 0 CHECK(minute BETWEEN 0 AND 59),
  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), gif TEXT NOT NULL DEFAULT '',
- leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'))
+ leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only')),
+ public_birthdays INTEGER NOT NULL DEFAULT 1 CHECK(public_birthdays IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS birthdays (
  guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
@@ -48,11 +49,17 @@ CREATE TABLE IF NOT EXISTS cleanup (
  attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS cleanup_due ON cleanup(delete_at,retry_at);
+CREATE TABLE IF NOT EXISTS directory_messages (
+ guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+ channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL UNIQUE,
+ PRIMARY KEY(guild_id,channel_id)
+);
 INSERT OR IGNORE INTO receipts SELECT guild_id,user_id,year FROM deliveries WHERE state='sent';
 CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
+CREATE INDEX IF NOT EXISTS birthdays_public_guild_date ON birthdays(guild_id,month,day,user_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 """
 
 
@@ -75,7 +82,7 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
@@ -92,6 +99,8 @@ class Database:
                     "CREATE TABLE IF NOT EXISTS deliveries", "CREATE TABLE deliveries_next"
                 )
                 migration += "INSERT INTO deliveries_next SELECT * FROM deliveries; DROP TABLE deliveries; ALTER TABLE deliveries_next RENAME TO deliveries;"
+            if version in (1, 2, 3):
+                migration += "ALTER TABLE guilds ADD COLUMN public_birthdays INTEGER NOT NULL DEFAULT 1 CHECK(public_birthdays IN (0,1));"
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
         except BaseException:
@@ -99,9 +108,9 @@ class Database:
             raise
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, write=True):
         async with self.lock:
-            await self.conn.execute("BEGIN IMMEDIATE")
+            await self.conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             try:
                 yield self.conn
                 await self.conn.commit()
@@ -126,18 +135,44 @@ class Database:
         return rows[0]
 
     async def configure(
-        self, guild_id, channel_id, alert_channel_id, zone, hour, minute, gif, leap="feb28"
+        self,
+        guild_id,
+        channel_id,
+        alert_channel_id,
+        zone,
+        hour,
+        minute,
+        gif,
+        leap="feb28",
+        public_birthdays=None,
     ):
         async with self.transaction() as conn:
+            previous = await (
+                await conn.execute(
+                    "SELECT public_birthdays FROM guilds WHERE guild_id=?", (guild_id,)
+                )
+            ).fetchone()
             await conn.execute(
                 """UPDATE guilds SET channel_id=?, alert_channel_id=?, timezone=?,
-                hour=?, minute=?, gif=?, leap=? WHERE guild_id=?""",
-                (channel_id, alert_channel_id, zone, hour, minute, gif, leap, guild_id),
+                hour=?, minute=?, gif=?, leap=?, public_birthdays=COALESCE(?,public_birthdays) WHERE guild_id=?""",
+                (
+                    channel_id,
+                    alert_channel_id,
+                    zone,
+                    hour,
+                    minute,
+                    gif,
+                    leap,
+                    public_birthdays,
+                    guild_id,
+                ),
             )
             await conn.execute(
                 "UPDATE birthdays SET hour=?,minute=?,leap=? WHERE guild_id=?",
                 (hour, minute, leap, guild_id),
             )
+            if public_birthdays is not None and previous and previous[0] != public_birthdays:
+                await self._invalidate_directories(conn, guild_id)
 
     async def pause(self, guild_id, paused):
         async with self.transaction() as conn:
@@ -178,6 +213,78 @@ class Database:
                     datetime.now(UTC).timestamp(),
                 ),
             )
+            await self._invalidate_directories(conn, guild_id)
+
+    async def directory(self, guild_id, *, public_only=True, month=None, page=0):
+        """Return one indexed calendar page and aggregate counts in one snapshot."""
+        if month is not None and month not in range(1, 13):
+            raise ValueError("Choose a month from January through December.")
+        public_clause = " AND consent=1" if public_only else ""
+        month_clause = " AND month=?" if month is not None else ""
+        async with self.transaction(write=False) as conn:
+            configured = (
+                await (
+                    await conn.execute(
+                        "SELECT count(*) FROM birthdays WHERE guild_id=?", (guild_id,)
+                    )
+                ).fetchone()
+            )[0]
+            counts_query = (
+                "SELECT month,count(*) FROM birthdays WHERE guild_id=?"  # noqa: S608 - fixed SQL fragments
+                + public_clause
+                + " GROUP BY month ORDER BY month"
+            )
+            counts = await (await conn.execute(counts_query, (guild_id,))).fetchall()
+            monthly = {row[0]: row[1] for row in counts}
+            visible = sum(monthly.values())
+            filtered = monthly.get(month, 0) if month is not None else visible
+            pages = max(1, (filtered + 9) // 10)
+            page = max(0, min(page, pages - 1))
+            parameters = (
+                (guild_id, month, page * 10) if month is not None else (guild_id, page * 10)
+            )
+            rows_query = (
+                "SELECT user_id,month,day FROM birthdays WHERE guild_id=?"  # noqa: S608 - fixed SQL fragments
+                + public_clause
+                + month_clause
+                + " ORDER BY month,day,user_id LIMIT 10 OFFSET ?"
+            )
+            rows = await (await conn.execute(rows_query, parameters)).fetchall()
+        return {
+            "configured": configured,
+            "visible": visible,
+            "months": monthly,
+            "rows": rows,
+            "page": page,
+            "pages": pages,
+            "filtered": filtered,
+        }
+
+    async def _invalidate_directories(self, conn, guild_id):
+        # Queue removal of old public snapshots whenever dates or visibility change.
+        await conn.execute(
+            "UPDATE cleanup SET delete_at=?,retry_at=0 WHERE message_id IN (SELECT message_id FROM directory_messages WHERE guild_id=?)",
+            (datetime.now(UTC).timestamp(), guild_id),
+        )
+        await conn.execute("DELETE FROM directory_messages WHERE guild_id=?", (guild_id,))
+
+    async def directory_message(self, guild_id, channel_id):
+        rows = await self.read(
+            "SELECT d.* FROM directory_messages d JOIN cleanup c ON c.message_id=d.message_id WHERE d.guild_id=? AND d.channel_id=? AND c.delete_at>?",
+            (guild_id, channel_id, datetime.now(UTC).timestamp()),
+        )
+        return rows[0] if rows else None
+
+    async def register_directory(self, guild_id, channel_id, message_id, created_at):
+        async with self.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO directory_messages VALUES (?,?,?) ON CONFLICT(guild_id,channel_id) DO UPDATE SET message_id=excluded.message_id",
+                (guild_id, channel_id, message_id),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO cleanup(message_id,guild_id,channel_id,delete_at) VALUES (?,?,?,?)",
+                (message_id, guild_id, channel_id, created_at + 86400),
+            )
 
     async def candidates(self, now):
         days = {(now + timedelta(hours=offset)).date() for offset in (-12, 0, 14)}
@@ -207,6 +314,7 @@ class Database:
             await conn.execute(
                 "DELETE FROM birthdays WHERE guild_id=? AND user_id=?", (guild_id, user_id)
             )
+            await self._invalidate_directories(conn, guild_id)
 
     async def drop_guild(self, guild_id):
         async with self.transaction() as conn:
@@ -266,6 +374,7 @@ class Database:
 
     async def cleanup_done(self, message_id):
         async with self.transaction() as conn:
+            await conn.execute("DELETE FROM directory_messages WHERE message_id=?", (message_id,))
             await conn.execute("DELETE FROM cleanup WHERE message_id=?", (message_id,))
 
     async def cleanup_retry(self, message_id, retry_at):

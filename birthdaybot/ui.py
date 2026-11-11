@@ -141,6 +141,7 @@ class BirthdayWizard(OwnedView):
         )
         self.day_page = int(bool(self.day and self.day >= 25))
         self.completed = False
+        self.public_birthdays = bool(settings["public_birthdays"])
         self.build()
 
     def content(self):
@@ -149,9 +150,14 @@ class BirthdayWizard(OwnedView):
             "**Your birthday**\n"
             f"Month: **{month}**\nDay: **{self.day or 'Choose below'}**\n"
             f"Timezone: **{self.zone.replace('_', ' ')}**\n"
-            f"Birthday announcement: **{'OFF (opted out)' if self.opt_out else 'ON'}**\n\n"
-            "Choose your details, then **Save**. Only you and moderators can view this record. "
-            "When announcements are on, we celebrate you in the birthday channel."
+            f"Birthday sharing: **{'OFF (opted out)' if self.opt_out else 'ON'}**\n\n"
+            "Choose your details, then **Save**. "
+            + (
+                "Your month and day are shared publicly when announcements are on. "
+                if self.public_birthdays
+                else "Birthday browsing is restricted to moderators in this server. "
+            )
+            + "Turn announcements OFF to hide your date from public lists and birthday posts."
         )
 
     def build(self):
@@ -274,9 +280,7 @@ class BirthdayWizard(OwnedView):
                 disabled=not (self.month and self.day),
             )
         )
-        self.add_item(
-            button("Announcements: " + ("OFF" if self.opt_out else "ON"), self.toggle, row=3)
-        )
+        self.add_item(button("Sharing: " + ("OFF" if self.opt_out else "ON"), self.toggle, row=3))
         self.add_item(button("Cancel", self.cancel, row=3))
 
     async def toggle(self, interaction):
@@ -321,9 +325,14 @@ class BirthdayWizard(OwnedView):
             f"✅ Birthday {'updated' if self.update else 'saved'}: **{calendar.month_name[self.month]} {self.day}**\n"
             f"Timezone: **{self.zone.replace('_', ' ')}**\n"
             + (
-                "You opted out of birthday announcements."
+                "You opted out of public birthday lists and announcements."
                 if self.opt_out
                 else "We'll celebrate in the birthday channel on your birthday."
+                + (
+                    " Your month and day are also shared in the public birthday list."
+                    if settings["public_birthdays"]
+                    else ""
+                )
             )
             + "\nUse `/birthday update` to change it or `/birthday delete` to remove it."
         )
@@ -378,6 +387,7 @@ class SettingsWizard(OwnedView):
         self.hour, self.minute = settings["hour"], settings["minute"]
         self.gif = settings["gif"]
         self.leap = settings["leap"]
+        self.public_birthdays = bool(settings["public_birthdays"])
         for row, label, attr in [
             (0, "Birthday announcements channel", "channel_id"),
             (1, "Optional moderator alerts channel", "alert_id"),
@@ -414,6 +424,29 @@ class SettingsWizard(OwnedView):
 
         leap.callback = choose_leap
         self.add_item(leap)
+        visibility = discord.ui.Select(
+            placeholder="Birthday list access",
+            row=3,
+            options=[
+                discord.SelectOption(
+                    label="Public — everyone can browse",
+                    value="public",
+                    default=self.public_birthdays,
+                ),
+                discord.SelectOption(
+                    label="Private — moderators only",
+                    value="private",
+                    default=not self.public_birthdays,
+                ),
+            ],
+        )
+
+        async def choose_visibility(interaction):
+            self.public_birthdays = visibility.values[0] == "public"
+            await edit(interaction, content=self.content(), view=self)
+
+        visibility.callback = choose_visibility
+        self.add_item(visibility)
         self.add_item(button("Time / GIF", self.defaults))
         self.add_item(button("Clear alerts", self.clear_alerts))
         self.add_item(button("Save settings", self.save, style=discord.ButtonStyle.success))
@@ -423,6 +456,7 @@ class SettingsWizard(OwnedView):
             f"**Birthday bot setup · moderators only**\n"
             f"Birthday channel: {f'<#{self.channel_id}>' if self.channel_id else 'NOT SET'}\n"
             f"Alerts channel: {f'<#{self.alert_id}>' if self.alert_id else 'OFF — warnings in logs only'}\n"
+            f"Birthday list access: **{'Public' if self.public_birthdays else 'Moderators only'}** · opted-out dates stay hidden publicly\n"
             f"Announcement time: **{self.hour:02}:{self.minute:02} in each member's timezone**\n"
             f"February 29 rule: **{ {'feb28': 'February 28', 'mar1': 'March 1', 'leap_only': 'leap years only'}[self.leap] }**\n"
             "Time and leap-day changes apply to all birthdays in this server.\n"
@@ -463,7 +497,9 @@ class SettingsWizard(OwnedView):
 
     async def save(self, interaction):
         guild = interaction.guild
-        issues = channel_issues(guild.get_channel(self.channel_id or 0), guild)
+        issues = (
+            channel_issues(guild.get_channel(self.channel_id), guild) if self.channel_id else []
+        )
         if self.alert_id:
             issues += channel_issues(guild.get_channel(self.alert_id), guild)
         if not (self.gif or self.bot.config.gif):
@@ -482,6 +518,7 @@ class SettingsWizard(OwnedView):
                 self.minute,
                 self.gif,
                 self.leap,
+                self.public_birthdays,
             )
         self.stop()
         await interaction.edit_original_response(
