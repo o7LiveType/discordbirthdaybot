@@ -8,7 +8,7 @@ import pytest
 
 from birthdaybot.delivery import Scheduler
 
-NOW = datetime(2026, 11, 10, 17, tzinfo=UTC)
+NOW = datetime(2026, 11, 10, 15, tzinfo=UTC)
 
 
 async def fixture(db):
@@ -31,8 +31,8 @@ async def fixture(db):
     bot.user.id = 9
     bot.latency = 0.1
     bot.live_clock = False
-    await db.configure(1, 100, None, "America/Denver", 9, 0, "")
-    await db.save(1, 2, 11, 10, "America/Denver", 9, 0, "feb28", True)
+    await db.configure(1, 100, None, "America/New_York", 9, 0, "")
+    await db.save(1, 2, 11, 10, "America/New_York", 9, 0, "feb28", True)
     return Scheduler(bot), guild, channel
 
 
@@ -54,7 +54,7 @@ async def test_send_once_across_repeat_ticks_and_restart(db):
 async def test_no_unauthorized_or_wrong_day_posts(db, change):
     scheduler, guild, channel = await fixture(db)
     if change == "optout":
-        await db.save(1, 2, 11, 10, "America/Denver", 9, 0, "feb28", False)
+        await db.save(1, 2, 11, 10, "America/New_York", 9, 0, "feb28", False)
     elif change == "paused":
         await db.pause(1, True)
     elif change == "wrong_guild":

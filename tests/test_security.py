@@ -129,7 +129,7 @@ async def test_update_preserves_optout_unless_explicitly_changed(db):
 async def test_save_is_private_uses_current_moderator_settings_and_keeps_optout(db):
     bot = SimpleNamespace(db=db, queue=None, mutation_lock=asyncio.Lock())
     view = BirthdayWizard(bot, 10, 1, await db.guild(1), opt_out=True)
-    view.month, view.day, view.zone = 11, 10, "America/Denver"
+    view.month, view.day, view.zone = 11, 10, "America/New_York"
     await db.configure(1, 100, None, "UTC", 10, 30, "", "mar1")
     value = interaction()
     value.response.defer = AsyncMock()

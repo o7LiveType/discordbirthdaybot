@@ -214,7 +214,6 @@ class BirthdayWizard(OwnedView):
         self.add_item(days)
         common = [
             "UTC",
-            "America/Denver",
             "America/New_York",
             "America/Chicago",
             "America/Los_Angeles",
@@ -263,7 +262,7 @@ class BirthdayWizard(OwnedView):
                 await interaction.response.send_modal(
                     FieldsModal(
                         "Your timezone",
-                        [("zone", "IANA timezone, e.g. America/Denver", self.zone)],
+                        [("zone", "IANA timezone, e.g. America/New_York", self.zone)],
                         submit,
                         self.owner,
                     )

@@ -11,7 +11,7 @@ from scripts.backup import backup
 
 
 async def test_live_backup_includes_uncheckpointed_wal_and_is_private(db, tmp_path):
-    await db.save(1, 2, 11, 10, "America/Denver", 9, 0, "feb28", True)
+    await db.save(1, 2, 11, 10, "America/New_York", 9, 0, "feb28", True)
     destination = tmp_path / "backup.sqlite3"
     backup(db.path, destination)
     with closing(sqlite3.connect(destination)) as snapshot:
@@ -45,7 +45,7 @@ async def run():
     db = Database(Path(sys.argv[1]))
     await db.open()
     await db.ensure_guild(1)
-    await db.save(1,2,11,10,'America/Denver',9,0,'feb28',True)
+    await db.save(1,2,11,10,'America/New_York',9,0,'feb28',True)
     job = await db.claim(await db.birthday(1,2),2026,100,1000)
     await db.delivery_state(job,'sending')
     os._exit(0)

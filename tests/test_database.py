@@ -7,7 +7,7 @@ from birthdaybot.database import Database
 
 
 async def save(db, guild=1, user=2):
-    await db.save(guild, user, 2, 29, "America/Denver", 9, 0, "feb28", False)
+    await db.save(guild, user, 2, 29, "America/New_York", 9, 0, "feb28", False)
 
 
 async def test_durability_modes_and_foreign_keys(db):
@@ -74,7 +74,7 @@ async def test_delete_and_readd_cannot_bypass_annual_spam_guard(db):
     job = await db.claim(await db.birthday(1, 2), 2026, 100, 100)
     await db.delivery_state(job, "sent")
     await db.forget(1, 2)
-    await db.save(1, 2, 11, 10, "America/Denver", 9, 0, "feb28", True)
+    await db.save(1, 2, 11, 10, "America/New_York", 9, 0, "feb28", True)
     assert not await db.candidates(datetime(2026, 11, 10, 17, tzinfo=UTC))
     assert len(await db.candidates(datetime(2027, 11, 10, 17, tzinfo=UTC))) == 1
 
@@ -99,13 +99,33 @@ async def test_admin_time_change_applies_to_existing_records(db):
 
 async def test_new_servers_default_to_midnight(db):
     assert ((await db.guild(1))["hour"], (await db.guild(1))["minute"]) == (0, 0)
+    assert (await db.guild(1))["timezone"] == "America/New_York"
+
+
+async def test_new_york_prefill_migration_preserves_explicit_member_timezones(db):
+    await db.ensure_guild(2)
+    await db.configure(1, 100, None, "America/Denver", 0, 0, "")
+    await db.configure(2, 200, None, "Europe/London", 0, 0, "")
+    await db.save(1, 10, 1, 1, "Asia/Tokyo", 0, 0, "feb28", True)
+    async with db.transaction() as conn:
+        await conn.execute("PRAGMA user_version=5")
+    upgraded = Database(db.path)
+    await upgraded.open()
+    try:
+        assert (await upgraded.guild(1))["timezone"] == "America/New_York"
+        assert (await upgraded.guild(2))["timezone"] == "Europe/London"
+        assert (await upgraded.birthday(1, 10))["timezone"] == "Asia/Tokyo"
+        await upgraded.ensure_guild(3)
+        assert (await upgraded.guild(3))["timezone"] == "America/New_York"
+    finally:
+        await upgraded.close()
 
 
 async def test_midnight_upgrade_updates_legacy_records_once_and_preserves_custom_times(db):
     await db.ensure_guild(2)
     await db.configure(1, 100, None, "UTC", 9, 0, "")
     await db.configure(2, 200, None, "UTC", 18, 45, "")
-    await db.save(1, 10, 1, 1, "America/Denver", 9, 0, "feb28", True)
+    await db.save(1, 10, 1, 1, "America/New_York", 9, 0, "feb28", True)
     await db.save(2, 20, 1, 1, "Asia/Tokyo", 18, 45, "feb28", False)
     async with db.transaction() as conn:
         await conn.execute("PRAGMA user_version=4")

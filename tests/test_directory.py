@@ -23,7 +23,7 @@ async def seed(db):
         (13, 2, 29, True),
         (14, 11, 9, False),
     ]:
-        await db.save(1, user, month, day, "America/Denver", 9, 0, "feb28", consent)
+        await db.save(1, user, month, day, "America/New_York", 9, 0, "feb28", consent)
     await db.ensure_guild(2)
     await db.save(2, 99, 3, 3, "UTC", 9, 0, "feb28", True)
 
@@ -85,7 +85,7 @@ async def test_public_embed_has_only_dates_and_monthly_summary_hides_optouts(db)
     view = DirectoryView(bot, 20, 1)
     public = (await view.render())["embed"].to_dict()
     encoded = json.dumps(public)
-    assert "America/Denver" not in encoded and "09:00" not in encoded
+    assert "America/New_York" not in encoded and "09:00" not in encoded
     assert "<@14>" not in encoded and "<@99>" not in encoded
     assert "<@11>" in encoded
     view.summary = True

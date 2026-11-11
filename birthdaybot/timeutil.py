@@ -11,7 +11,7 @@ LEAP_POLICIES = {"feb28", "mar1", "leap_only"}
 def timezone(value: str) -> str:
     value = value.strip()
     if value not in ZONES:
-        raise ValueError("Choose an IANA timezone, for example America/Denver or Europe/London.")
+        raise ValueError("Choose an IANA timezone, for example America/New_York or Europe/London.")
     try:
         ZoneInfo(value)
     except (ValueError, ZoneInfoNotFoundError) as exc:
