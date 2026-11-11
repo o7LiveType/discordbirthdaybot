@@ -80,6 +80,13 @@ class Scheduler:
     async def tick(self, now):
         self.last_tick = now
         self.backlog = False
+        for job in await self.db.read(
+            "SELECT * FROM deliveries WHERE state IN ('sending','uncertain') AND retry_at<=? ORDER BY retry_at LIMIT 10",
+            (now.timestamp(),),
+        ):
+            if self.bot.get_guild(job["guild_id"]) is not None:
+                async with self.bot.mutation_lock:
+                    await self.reconcile(job, await self.db.guild(job["guild_id"]))
         await self.cleanup_messages(now)
         settings_by_id = {r["guild_id"]: r for r in await self.db.read("SELECT * FROM guilds")}
         if not hasattr(self, "_health_check") or (now - self._health_check).total_seconds() >= 300:

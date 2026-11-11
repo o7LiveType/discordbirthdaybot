@@ -176,3 +176,31 @@ async def test_failed_cleanup_retries_durably_and_already_deleted_is_success(db)
     assert (await db.read("SELECT attempts FROM cleanup"))[0][0] == 1
     await Scheduler(scheduler.bot).cleanup_messages(NOW + timedelta(hours=24, minutes=2))
     assert not await db.read("SELECT * FROM cleanup")
+
+
+async def test_crash_recovery_after_birthday_and_record_deletion_still_expires_public_post(db):
+    scheduler, guild, channel = await fixture(db)
+    job = await db.claim(await db.birthday(1, 2), 2026, 100, NOW.timestamp())
+    await db.delivery_state(job, "sending")
+    await db.forget(1, 2)
+    assert await db.birthday(1, 2) is None
+
+    async def history(**kwargs):
+        yield SimpleNamespace(
+            id=600,
+            created_at=NOW,
+            author=SimpleNamespace(id=9),
+            embeds=[
+                SimpleNamespace(footer=SimpleNamespace(text=f"Birthday delivery {job['marker']}"))
+            ],
+        )
+
+    channel.history = history
+    removed = AsyncMock()
+    scheduler.bot.get_partial_messageable.return_value.get_partial_message.return_value.delete = (
+        removed
+    )
+    await scheduler.tick(NOW + timedelta(days=2))
+    channel.send.assert_not_awaited()
+    removed.assert_awaited_once()
+    assert not await db.read("SELECT * FROM cleanup")

@@ -360,7 +360,7 @@ class Confirm(OwnedView):
         self.completed = True
         self.stop()
         await interaction.edit_original_response(
-            content="✅ Your birthday record was deleted from this server.", view=None
+            content="✅ Birthday record deleted from this server.", view=None
         )
 
     async def cancel(self, interaction):

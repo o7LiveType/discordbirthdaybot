@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
  created_at REAL NOT NULL, attempted_at REAL, retry_at REAL NOT NULL DEFAULT 0,
  attempts INTEGER NOT NULL DEFAULT 0, message_id INTEGER, error TEXT,
  PRIMARY KEY(guild_id,user_id,year),
- FOREIGN KEY(guild_id,user_id) REFERENCES birthdays(guild_id,user_id) ON DELETE CASCADE
+ FOREIGN KEY(guild_id) REFERENCES guilds(guild_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS notices (
  guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
@@ -51,7 +51,8 @@ CREATE INDEX IF NOT EXISTS cleanup_due ON cleanup(delete_at,retry_at);
 INSERT OR IGNORE INTO receipts SELECT guild_id,user_id,year FROM deliveries WHERE state='sent';
 CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
-PRAGMA user_version=2;
+CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
+PRAGMA user_version=3;
 """
 
 
@@ -74,13 +75,23 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
                 if version == 1
                 else ""
             )
+            if version in (1, 2):
+                delivery_schema = SCHEMA[
+                    SCHEMA.index("CREATE TABLE IF NOT EXISTS deliveries") : SCHEMA.index(
+                        "CREATE TABLE IF NOT EXISTS notices"
+                    )
+                ]
+                migration += delivery_schema.replace(
+                    "CREATE TABLE IF NOT EXISTS deliveries", "CREATE TABLE deliveries_next"
+                )
+                migration += "INSERT INTO deliveries_next SELECT * FROM deliveries; DROP TABLE deliveries; ALTER TABLE deliveries_next RENAME TO deliveries;"
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
         except BaseException:
@@ -187,6 +198,12 @@ class Database:
 
     async def forget(self, guild_id, user_id):
         async with self.transaction() as conn:
+            # Preserve unresolved send markers until their public post can be found
+            # and scheduled for deletion; the private birthday itself is erased.
+            await conn.execute(
+                "DELETE FROM deliveries WHERE guild_id=? AND user_id=? AND state NOT IN ('sending','uncertain')",
+                (guild_id, user_id),
+            )
             await conn.execute(
                 "DELETE FROM birthdays WHERE guild_id=? AND user_id=?", (guild_id, user_id)
             )
