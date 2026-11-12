@@ -1,12 +1,15 @@
 import calendar
 import logging
 import time
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import discord
 
 from .config import DEFAULT_GIF, gif_url
 from .delivery import channel_issues
-from .timeutil import anniversary, find_timezones, timezone, timezone_label
+from .timeutil import anniversary, format_offset, timezone, timezone_label
+from .timezone_catalog import REGIONS, catalog, search_timezones
 
 log = logging.getLogger(__name__)
 
@@ -62,56 +65,46 @@ class OwnedView(discord.ui.View):
 
             async def run(interaction):
                 # Opening a modal must be the initial response, not a deferred job.
-                if (
+                if getattr(callback, "opens_modal", False) or (
                     isinstance(item, discord.ui.Select)
                     and item.values
                     and item.values[0] in getattr(callback, "opens_modal_values", {"custom"})
                 ):
-                    return await callback(interaction)
+                    if await self.check_access(interaction):
+                        return await callback(interaction)
+                    return
 
                 async def execute():
-                    if (
-                        (not getattr(self, "public", False) and interaction.user.id != self.owner)
-                        or not interaction.guild
-                        or interaction.guild_id != getattr(self, "guild_id", interaction.guild_id)
-                        or (
-                            getattr(self, "public", False)
-                            and not isinstance(interaction.user, discord.Member)
-                        )
-                    ):
-                        await private(
-                            interaction,
-                            "This private menu belongs to someone else. Open /birthdaybot yourself.",
-                        )
-                        return
-                    if self.is_finished():
-                        await private(interaction, "This menu expired. Open /birthdaybot again.")
-                        return
-                    if self.admin and not moderator(interaction):
-                        await private(interaction, "You need Manage Server permission to continue.")
-                        return
-                    return await callback(interaction)
+                    if await self.check_access(interaction):
+                        return await callback(interaction)
 
                 return await self.queue.run(interaction, execute, update=True, rate_checked=True)
 
             item.callback = run
         return super().add_item(item)
 
-    async def interaction_check(self, interaction):
+    async def check_access(self, interaction):
         if self.is_finished():
             await private(interaction, "This menu expired. Open /birthdaybot again.")
             return False
         if (
-            interaction.user.id != self.owner
+            (not getattr(self, "public", False) and interaction.user.id != self.owner)
             or not interaction.guild
             or interaction.guild_id != getattr(self, "guild_id", interaction.guild_id)
+            or (getattr(self, "public", False) and not isinstance(interaction.user, discord.Member))
         ):
             await private(
-                interaction, "This private menu belongs to someone else. Run the command yourself."
+                interaction,
+                "This private menu belongs to someone else. Open /birthdaybot yourself.",
             )
             return False
         if self.admin and not moderator(interaction):
             await private(interaction, "You need Manage Server permission to continue.")
+            return False
+        return True
+
+    async def interaction_check(self, interaction):
+        if not await self.check_access(interaction):
             return False
         if time.monotonic() - self.last_click < 0.4:
             await private(interaction, "Please wait a moment between menu actions.")
@@ -191,9 +184,25 @@ class FieldsModal(discord.ui.Modal):
         await private(interaction, "Could not save this form. Please reopen it and try again.")
 
 
-def button(label, callback, *, style=discord.ButtonStyle.secondary, row=4, disabled=False):
+def button(
+    label,
+    callback,
+    *,
+    style=discord.ButtonStyle.secondary,
+    row=4,
+    disabled=False,
+    opens_modal=False,
+):
     item = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
-    item.callback = callback
+    if opens_modal:
+
+        async def open_form(interaction):
+            await callback(interaction)
+
+        open_form.opens_modal = True
+        item.callback = open_form
+    else:
+        item.callback = callback
     return item
 
 
@@ -205,6 +214,224 @@ def navigation(bot, owner, guild_id, *, admin=False):
     if admin:
         view.add_item(button("Server tools", bot.menu_actions["tools"]))
     return bot.track_view(view, guild_id, owner)
+
+
+class TimezoneBrowser:
+    """A screen inside the birthday draft, sharing its owner, queue and expiry."""
+
+    PAGE_SIZE = 25
+    OFFSET_PAGE_SIZE = 22
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.region = self.offset = self.query = self.selected = None
+        self.page = self.offset_page = 0
+        self.invalid = False
+        self.notice = ""
+
+    def results(self):
+        entries = catalog()
+        if self.invalid:
+            return []
+        if self.query:
+            entries = search_timezones(self.query, entries)
+        return [
+            entry
+            for entry in entries
+            if (self.region is None or entry.region == self.region)
+            and (self.offset is None or entry.offset == self.offset)
+        ]
+
+    def content(self):
+        matches = self.results()
+        pages = max(1, (len(matches) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        selected = next((entry for entry in matches if entry.name == self.selected), None)
+        selection = "Choose a city/name below."
+        if selected:
+            local = datetime.now(UTC).astimezone(ZoneInfo(selected.name))
+            selection = f"✅ Selected: **{timezone_label(selected.name)}**\nLocal clock there: **{local:%a %d %b, %H:%M}**"
+        return (
+            "**Choose your timezone**\n"
+            f"Birthday draft currently uses: **{timezone_label(self.parent.zone)}**\n"
+            "Browse a region and its cities, filter by the current UTC offset, or press **Search**.\n"
+            f"Region: **{REGIONS.get(self.region, 'All regions')}** · Offset: **{format_offset(self.offset) if self.offset is not None else 'Any'}**\n"
+            f"**{len(matches)} matches** · page {self.page + 1}/{pages}\n"
+            + (self.notice + "\n" if self.notice else "")
+            + selection
+            + "\n\n"
+            "Choose a nearby city with the same clock and daylight-saving rules; your exact city is unnecessary. "
+            "Offsets shown are current. City timezones follow daylight saving automatically. "
+            "All choices and searches stay inside Discord; no device or location detection."
+        )
+
+    async def refresh(self, interaction):
+        self.parent.build()
+        await edit(interaction, content=self.parent.content(), view=self.parent)
+
+    def build(self):
+        parent = self.parent
+        regions = discord.ui.Select(
+            placeholder="1. Region / continent",
+            row=0,
+            options=[
+                discord.SelectOption(label="All regions", value="all", default=self.region is None),
+                *[
+                    discord.SelectOption(label=label, value=key, default=self.region == key)
+                    for key, label in REGIONS.items()
+                ],
+            ],
+        )
+
+        async def choose_region(interaction):
+            self.region = None if regions.values[0] == "all" else regions.values[0]
+            self.page, self.query, self.selected, self.invalid, self.notice = (
+                0,
+                None,
+                None,
+                False,
+                "",
+            )
+            await self.refresh(interaction)
+
+        regions.callback = choose_region
+        parent.add_item(regions)
+        values = sorted({entry.offset for entry in catalog()})
+        pages = max(1, (len(values) + self.OFFSET_PAGE_SIZE - 1) // self.OFFSET_PAGE_SIZE)
+        self.offset_page = max(0, min(self.offset_page, pages - 1))
+        options = [
+            discord.SelectOption(
+                label="Any current UTC offset", value="all", default=self.offset is None
+            )
+        ]
+        options += [
+            discord.SelectOption(
+                label=format_offset(value), value=str(value), default=self.offset == value
+            )
+            for value in values[
+                self.offset_page * self.OFFSET_PAGE_SIZE : (self.offset_page + 1)
+                * self.OFFSET_PAGE_SIZE
+            ]
+        ]
+        if self.offset_page:
+            options.append(discord.SelectOption(label="← Previous UTC offsets", value="previous"))
+        if self.offset_page + 1 < pages:
+            options.append(discord.SelectOption(label="More UTC offsets →", value="next"))
+        offsets = discord.ui.Select(
+            placeholder="2. Current UTC offset (optional)", row=1, options=options
+        )
+
+        async def choose_offset(interaction):
+            value = offsets.values[0]
+            if value in {"previous", "next"}:
+                self.offset_page += 1 if value == "next" else -1
+            else:
+                self.offset = None if value == "all" else int(value)
+                self.page, self.query, self.selected, self.invalid, self.notice = (
+                    0,
+                    None,
+                    None,
+                    False,
+                    "",
+                )
+            await self.refresh(interaction)
+
+        offsets.callback = choose_offset
+        parent.add_item(offsets)
+        matches = self.results()
+        self.page = max(0, min(self.page, max(0, (len(matches) - 1) // self.PAGE_SIZE)))
+        if matches:
+            cities = discord.ui.Select(
+                placeholder="3. Choose a city / timezone name",
+                row=2,
+                options=[
+                    discord.SelectOption(
+                        label=entry.label,
+                        description=entry.description,
+                        value=entry.name,
+                        default=entry.name == self.selected,
+                    )
+                    for entry in matches[
+                        self.page * self.PAGE_SIZE : (self.page + 1) * self.PAGE_SIZE
+                    ]
+                ],
+            )
+
+            async def choose_city(interaction):
+                if cities.values[0] not in {entry.name for entry in self.results()}:
+                    raise ValueError("Choose a timezone from the current results.")
+                self.selected = timezone(cities.values[0])
+                await self.refresh(interaction)
+
+            cities.callback = choose_city
+            parent.add_item(cities)
+        parent.add_item(button("Previous cities", self.previous, row=3, disabled=self.page == 0))
+        parent.add_item(
+            button(
+                "Next cities",
+                self.next,
+                row=3,
+                disabled=(self.page + 1) * self.PAGE_SIZE >= len(matches),
+            )
+        )
+        parent.add_item(button("Search", parent.open_zone_search, row=3, opens_modal=True))
+        parent.add_item(button("Reset filters", self.reset, row=3))
+        parent.add_item(
+            button(
+                "Use this timezone",
+                self.confirm,
+                row=4,
+                style=discord.ButtonStyle.success,
+                disabled=self.selected not in {entry.name for entry in matches},
+            )
+        )
+        parent.add_item(button("Back to birthday", self.back, row=4))
+
+    async def previous(self, interaction):
+        self.page -= 1
+        await self.refresh(interaction)
+
+    async def next(self, interaction):
+        self.page += 1
+        await self.refresh(interaction)
+
+    async def reset(self, interaction):
+        self.region = self.offset = self.query = self.selected = None
+        self.page = self.offset_page = 0
+        self.invalid, self.notice = False, ""
+        await self.refresh(interaction)
+
+    async def search(self, interaction, query):
+        # A search starts fresh; previous region/offset filters cannot hide matches.
+        self.region = self.offset = self.selected = None
+        self.page = 0
+        try:
+            matches = search_timezones(query)
+        except ValueError as exc:
+            self.query, self.invalid = None, True
+            self.notice = f"❌ {exc} Press Search to try again, or choose a region."
+        else:
+            self.query, self.invalid = query, False
+            self.selected = matches[0].name if len(matches) == 1 else None
+            self.notice = (
+                "✅ Valid match. Press Use this timezone to confirm."
+                if len(matches) == 1
+                else "Choose a result below."
+                if matches
+                else "No matches. Press Search to try again, or choose a region."
+            )
+        await self.refresh(interaction)
+
+    async def confirm(self, interaction):
+        if self.selected not in {entry.name for entry in self.results()}:
+            raise ValueError("Choose a valid timezone from the current results.")
+        self.parent.zone = timezone(self.selected)
+        self.parent.zone_valid = True
+        self.parent.zone_notice = "✅ Timezone selected. The current offset is shown; daylight saving follows this timezone's rules."
+        await self.back(interaction)
+
+    async def back(self, interaction):
+        self.parent.browsing_zone = False
+        await self.refresh(interaction)
 
 
 class BirthdayWizard(OwnedView):
@@ -223,22 +450,25 @@ class BirthdayWizard(OwnedView):
         self.completed = False
         self.public_birthdays = bool(settings["public_birthdays"])
         self.zone_valid = True
-        self.zone_matches = []
+        self.browsing_zone = False
+        self.zone_browser = TimezoneBrowser(self)
         self.zone_notice = (
             "✅ Valid timezone. The offset shown is current; daylight saving is automatic."
         )
         self.build()
 
     def content(self):
+        if self.browsing_zone:
+            return self.zone_browser.content()
         month = calendar.month_name[self.month] if self.month else "Choose below"
         return (
             "**Your birthday**\n"
             f"Month: **{month}**\nDay: **{self.day or 'Choose below'}**\n"
             f"Timezone: **{timezone_label(self.zone) if self.zone_valid else 'Choose a valid timezone below'}**\n{self.zone_notice}\n"
             f"Birthday sharing: **{'OFF (opted out)' if self.opt_out else 'ON'}**\n\n"
-            "Choose your details, then **Save**. "
+            "Choose your details, then **Save**. Use **Browse all timezones** for region, city and UTC-offset filters; no external site is needed. "
             + (
-                "Your month and day are shared publicly when announcements are on. "
+                "Your month and day are shared publicly when sharing is ON. "
                 if self.public_birthdays
                 else "Birthday browsing is restricted to moderators in this server. "
             )
@@ -247,6 +477,9 @@ class BirthdayWizard(OwnedView):
 
     def build(self):
         self.clear_items()
+        if self.browsing_zone:
+            self.zone_browser.build()
+            return
         months = discord.ui.Select(
             placeholder="Month",
             row=0,
@@ -317,9 +550,9 @@ class BirthdayWizard(OwnedView):
             "Australia/Perth",
             "Pacific/Auckland",
         ]
-        zones = self.zone_matches or list(dict.fromkeys([self.zone] + common))[:24]
+        zones = list(dict.fromkeys([self.zone] + common))[:24]
         select = discord.ui.Select(
-            placeholder="Timezone",
+            placeholder="Timezone · quick choices",
             row=2,
             options=[
                 discord.SelectOption(
@@ -327,32 +560,15 @@ class BirthdayWizard(OwnedView):
                 )
                 for z in zones
             ]
-            + [discord.SelectOption(label="Other timezone…", value="custom")],
+            + [discord.SelectOption(label="Search city / region / UTC offset…", value="custom")],
         )
 
         async def choose_zone(interaction):
             if select.values[0] == "custom":
-
-                async def submit(submission, values):
-                    if self.is_finished():
-                        await private(submission, "This menu expired. Run the command again.")
-                        return
-                    await self.search_zone(submission, values["zone"])
-
-                await interaction.response.send_modal(
-                    FieldsModal(
-                        "Your timezone",
-                        [("zone", "City or IANA timezone, e.g. New York", "")],
-                        submit,
-                        self.owner,
-                        queue=self.queue,
-                        parent=self,
-                    )
-                )
+                await self.open_zone_search(interaction)
                 return
             self.zone = timezone(select.values[0])
             self.zone_valid = True
-            self.zone_matches = []
             self.zone_notice = (
                 "✅ Valid timezone. The offset shown is current; daylight saving is automatic."
             )
@@ -373,24 +589,33 @@ class BirthdayWizard(OwnedView):
         self.add_item(button("Sharing: " + ("OFF" if self.opt_out else "ON"), self.toggle, row=3))
         self.add_item(button("Cancel", self.cancel, row=3))
 
-    async def search_zone(self, interaction, query):
-        try:
-            matches = find_timezones(query)
-        except ValueError as exc:
-            self.zone_valid, self.zone_matches = False, []
-            self.zone_notice = f"❌ {exc} Choose a timezone below before saving."
-        else:
-            self.zone_matches = matches if len(matches) > 1 else []
-            self.zone_valid = len(matches) == 1
-            if self.zone_valid:
-                self.zone = matches[0]
-                self.zone_notice = "✅ Timezone validated. The offset shown is current; daylight saving is automatic."
-            else:
-                self.zone_notice = (
-                    f"⚠️ {len(matches)} valid matches. Choose your timezone below before saving."
-                )
+        self.add_item(button("Browse all timezones", self.browse_zones))
+        self.add_item(button("Search timezones", self.open_zone_search, opens_modal=True))
+
+    async def browse_zones(self, interaction):
+        self.zone_browser = TimezoneBrowser(self)
+        self.browsing_zone = True
         self.build()
         await edit(interaction, content=self.content(), view=self)
+
+    async def open_zone_search(self, interaction):
+        async def submit(submission, values):
+            await self.search_zone(submission, values["zone"])
+
+        await interaction.response.send_modal(
+            FieldsModal(
+                "Search timezones",
+                [("zone", "City, region or UTC offset (e.g. UTC+05:45)", "")],
+                submit,
+                self.owner,
+                queue=self.queue,
+                parent=self,
+            )
+        )
+
+    async def search_zone(self, interaction, query):
+        self.browsing_zone = True
+        await self.zone_browser.search(interaction, query)
 
     async def toggle(self, interaction):
         self.opt_out = not self.opt_out

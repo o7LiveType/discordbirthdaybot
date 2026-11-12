@@ -90,19 +90,24 @@ async def test_timezone_search_errors_ambiguity_and_canonical_confirmation(menu)
     view.month, view.day = 1, 1
     await view.search_zone(value, "@everyone\n<unsafe>")
     assert "❌" in view.content() and "@everyone" not in view.content()
-    assert next(item for item in view.children if getattr(item, "label", None) == "Save").disabled
+    assert next(
+        item for item in view.children if getattr(item, "label", None) == "Use this timezone"
+    ).disabled
+    assert view.zone == "UTC"  # A failed search cannot destroy the birthday draft.
     with pytest.raises(ValueError, match="valid timezone"):
-        await view.save(value)
+        await view.zone_browser.confirm(value)
     await view.search_zone(value, "Indiana")
-    assert 1 < len(view.zone_matches) <= 24
-    assert not view.zone_valid
+    matches = view.zone_browser.results()
+    assert 1 < len(matches) <= 25
     assert "Choose your timezone" in view.content()
     assert len(next(item for item in view.children if item.row == 2).options) <= 25
-    await choose(view, value, 2, view.zone_matches[0])
-    assert view.zone_valid
+    await choose(view, value, 2, matches[0].name)
+    assert view.zone_browser.selected == matches[0].name
     await view.search_zone(value, "new york")
-    assert view.zone == "America/New_York" and view.zone_valid
-    assert "validated" in view.content() and "UTC-" in view.content()
+    assert view.zone_browser.selected == "America/New_York" and view.zone == "UTC"
+    assert "Valid match" in view.content() and "UTC-" in view.content()
+    await click(bot, value, "Use this timezone")
+    assert view.zone == "America/New_York" and not view.browsing_zone
     await view.save(value)
     assert (await bot.db.birthday(1, 20))["timezone"] == "America/New_York"
     assert "UTC-" in value.edit_original_response.call_args.kwargs["content"]
@@ -380,3 +385,142 @@ async def test_private_actions_reject_a_different_guild_even_for_same_owner(menu
         item for item in view.children if getattr(item, "label", None) == "Sharing: ON"
     ).callback(value)
     assert not view.opt_out
+
+
+async def test_invalid_timezone_search_can_retry_immediately_without_changing_zone(menu):
+    bot, value = menu
+    await bot.menu_actions["set"](value)
+    view = bot.active_views[(1, 20)]
+    view.month, view.day, view.opt_out = 2, 29, True
+    value.response.is_done.return_value = False
+    value.response.defer = AsyncMock()
+    value.response.edit_message = AsyncMock()
+    await click(bot, value, "Search timezones")
+    value.response.defer.assert_not_awaited()  # Opening a button modal must be first.
+    first = value.response.send_modal.call_args.args[0]
+    first.inputs["zone"]._value = "<unsafe>"
+    await first.on_submit(value)
+    assert view.zone == "UTC" and view.browsing_zone
+    assert "❌" in view.content()
+    assert await bot.db.birthday(1, 20) is None
+    value.response.defer.reset_mock()
+    await click(bot, value, "Search")  # No timezone dropdown change needed.
+    value.response.defer.assert_not_awaited()
+    second = value.response.send_modal.call_args.args[0]
+    assert second is not first
+    second.inputs["zone"]._value = "NoSuchCityAnywhere"
+    await second.on_submit(value)
+    assert "No matches" in view.content() and view.zone == "UTC"
+    await click(bot, value, "Search")
+    third = value.response.send_modal.call_args.args[0]
+    third.inputs["zone"]._value = "Kathmandu"
+    await third.on_submit(value)
+    assert "Local clock there" in view.content() and "UTC+05:45" in view.content()
+    assert view.zone == "UTC"  # Still needs the explicit Use button.
+    await click(bot, value, "Use this timezone")
+    assert view.zone == "Asia/Kathmandu" and not view.browsing_zone
+    assert (view.month, view.day, view.opt_out) == (2, 29, True)
+    assert await bot.db.birthday(1, 20) is None
+    await click(bot, value, "Save")
+    assert (await bot.db.birthday(1, 20))["timezone"] == "Asia/Kathmandu"
+
+
+async def test_guided_browser_reaches_every_zone_with_valid_discord_components(menu):
+    from birthdaybot.timeutil import ZONES
+
+    bot, value = menu
+    await bot.menu_actions["set"](value)
+    await click(bot, value, "Browse all timezones")
+    view = bot.active_views[(1, 20)]
+    visited = set()
+    for page in range((len(ZONES) + 24) // 25):
+        assert view.zone_browser.page == page
+        components = view.to_components()
+        assert len(components) <= 5
+        for row in components:
+            assert len(row["components"]) <= 5
+            for item in row["components"]:
+                if item["type"] == 3:
+                    assert 1 <= len(item["options"]) <= 25
+                    assert all(len(option["label"]) <= 100 for option in item["options"])
+        cities = next(
+            item for item in view.children if isinstance(item, discord.ui.Select) and item.row == 2
+        )
+        visited.update(option.value for option in cities.options)
+        next_button = next(
+            item for item in view.children if getattr(item, "label", None) == "Next cities"
+        )
+        if next_button.disabled:
+            break
+        await click(bot, value, "Next cities")
+    assert visited == set(ZONES)
+    assert view.zone == "UTC"
+
+
+async def test_region_and_offset_filters_are_complete_and_reset_search_errors(menu):
+    from birthdaybot.timezone_catalog import catalog
+
+    bot, value = menu
+    await bot.menu_actions["set"](value)
+    await click(bot, value, "Browse all timezones")
+    view = bot.active_views[(1, 20)]
+    await view.search_zone(value, "<invalid>")
+    await choose(view, value, 0, "America")
+    assert view.zone_browser.results()
+    assert all(entry.region == "America" for entry in view.zone_browser.results())
+    # Every current offset remains reachable despite Discord's 25-option limit.
+    offsets = set()
+    while True:
+        menu_item = next(
+            item for item in view.children if isinstance(item, discord.ui.Select) and item.row == 1
+        )
+        offsets.update(
+            int(option.value)
+            for option in menu_item.options
+            if option.value not in {"all", "next", "previous"}
+        )
+        if not any(option.value == "next" for option in menu_item.options):
+            break
+        await choose(view, value, 1, "next")
+    assert offsets == {entry.offset for entry in catalog()}
+    await choose(view, value, 1, "345")  # No Americas city currently has this offset.
+    assert not view.zone_browser.results()
+    assert "0 matches" in view.content()
+    await click(bot, value, "Reset filters")
+    assert len(view.zone_browser.results()) == len(catalog())
+    await click(bot, value, "Back to birthday")
+    assert view.zone == "UTC" and not view.browsing_zone
+
+
+async def test_region_offset_search_results_require_an_iana_city_choice(menu):
+    bot, value = menu
+    await bot.menu_actions["set"](value)
+    view = bot.active_views[(1, 20)]
+    await view.search_zone(value, "Europe")
+    assert len(view.zone_browser.results()) > 25
+    assert view.zone_browser.selected is None
+    await choose(view, value, 2, "Europe/Amsterdam")
+    assert view.zone_browser.selected == "Europe/Amsterdam"
+    await click(bot, value, "Use this timezone")
+    assert view.zone == "Europe/Amsterdam"
+    await click(bot, value, "Browse all timezones")
+    await choose(view, value, 2, "Africa/Abidjan")
+    await click(bot, value, "Back to birthday")
+    assert view.zone == "Europe/Amsterdam"  # Back discards the unconfirmed candidate.
+
+
+async def test_search_button_cannot_open_for_wrong_owner_or_expired_menu(menu):
+    bot, value = menu
+    await bot.menu_actions["set"](value)
+    view = bot.active_views[(1, 20)]
+    search = next(
+        item for item in view.children if getattr(item, "label", None) == "Search timezones"
+    )
+    value.user.id = 21
+    await search.callback(value)
+    value.response.send_modal.assert_not_awaited()
+    value.user.id = 20
+    view.stop()
+    await search.callback(value)
+    value.response.send_modal.assert_not_awaited()
+    assert "expired" in value.followup.send.call_args.args[0]

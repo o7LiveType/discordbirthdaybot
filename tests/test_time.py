@@ -128,9 +128,9 @@ def test_timezone_search_canonicalizes_bounds_and_disambiguates():
     assert find_timezones("newyork") == ["America/New_York"]
     assert find_timezones("utc") == ["UTC"]
     assert 1 < len(find_timezones("Indiana")) <= 24
-    for value in ("America", "ThisCityDoesNotExist"):
-        with pytest.raises(ValueError):
-            find_timezones(value)
+    assert len(find_timezones("America")) > 25  # Broad searches are now paginated.
+    with pytest.raises(ValueError):
+        find_timezones("ThisCityDoesNotExist")
 
 
 @pytest.mark.parametrize(

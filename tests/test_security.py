@@ -100,7 +100,7 @@ async def test_menus_fit_discord_limits_and_preserve_opt_out(db):
     settings = await db.guild(1)
     view = BirthdayWizard(MagicMock(), 10, 1, settings)
     assert not view.opt_out
-    assert len(view.to_components()) == 4
+    assert len(view.to_components()) == 5
     view.month, view.day = 2, 29
     view.build()
     for component in view.children:

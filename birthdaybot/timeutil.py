@@ -34,27 +34,24 @@ def timezone(value: str) -> str:
 
 
 def find_timezones(value: str) -> list[str]:
-    query = timezone_query(value).casefold()
-    if query in ZONE_KEYS:
-        return [timezone(ZONE_KEYS[query])]
-    needle = query.replace("_", "")
-    matches = [zone for zone in ZONES if needle in zone.casefold().replace("_", "")]
+    from .timezone_catalog import search_timezones
+
+    matches = search_timezones(value)
     if not matches:
-        raise ValueError("Timezone not found. Try a nearby major city or a full IANA name.")
-    if len(matches) > 24:
-        raise ValueError(
-            "Too many timezone matches. Enter a more specific city or a full IANA name."
-        )
-    return matches
+        raise ValueError("Timezone not found. Try another search or browse the regions.")
+    return [entry.name for entry in matches]
+
+
+def format_offset(minutes: int) -> str:
+    sign = "+" if minutes >= 0 else "-"
+    hours, minutes = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours:02}:{minutes:02}"
 
 
 def timezone_label(zone: str, now: datetime | None = None) -> str:
     zone = timezone(zone)
     offset = (now or datetime.now(UTC)).astimezone(ZoneInfo(zone)).utcoffset()
-    minutes = int(offset.total_seconds() // 60)
-    sign = "+" if minutes >= 0 else "-"
-    hours, minutes = divmod(abs(minutes), 60)
-    return f"{zone} · UTC{sign}{hours:02}:{minutes:02} now"
+    return f"{zone} · {format_offset(int(offset.total_seconds() // 60))} now"
 
 
 def clock(value: str) -> tuple[int, int]:
