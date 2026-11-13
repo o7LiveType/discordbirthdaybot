@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS birthdays (
  consent INTEGER NOT NULL CHECK(consent IN (0,1)), updated_at REAL NOT NULL,
  PRIMARY KEY(guild_id,user_id)
 );
+CREATE TABLE IF NOT EXISTS birthday_import_pending (
+ guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+ user_id INTEGER NOT NULL, month INTEGER NOT NULL CHECK(month BETWEEN 1 AND 12),
+ day INTEGER NOT NULL CHECK(day BETWEEN 1 AND 31), timezone TEXT,
+ consent INTEGER NOT NULL CHECK(consent IN (0,1)), imported_at REAL NOT NULL,
+ imported_by INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS birthday_import_pending_date ON birthday_import_pending(guild_id,month,day,user_id);
 CREATE TABLE IF NOT EXISTS deliveries (
  guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, year INTEGER NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('ready','sending','sent','retry','uncertain','skipped')),
@@ -69,7 +77,7 @@ CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
 CREATE INDEX IF NOT EXISTS birthdays_public_guild_date ON birthdays(guild_id,month,day,user_id) WHERE consent=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=7;
+PRAGMA user_version=8;
 """
 
 
@@ -92,7 +100,7 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6, 7):
+            if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
@@ -221,6 +229,74 @@ class Database:
         )
         return rows[0] if rows else None
 
+    async def pending_birthday(self, guild_id, user_id):
+        rows = await self.read(
+            "SELECT * FROM birthday_import_pending WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        return rows[0] if rows else None
+
+    @staticmethod
+    def import_query(guild_id, user_ids):
+        values = ",".join("(?)" for _ in user_ids)
+        query = f"WITH incoming(user_id) AS (VALUES {values}) SELECT user_id FROM birthdays WHERE guild_id=? AND user_id IN (SELECT user_id FROM incoming) UNION SELECT user_id FROM birthday_import_pending WHERE guild_id=? AND user_id IN (SELECT user_id FROM incoming)"  # noqa: S608 - generated placeholders only
+        return query, (*user_ids, guild_id, guild_id)
+
+    async def import_existing(self, guild_id, user_ids):
+        if not user_ids:
+            return set()
+        query, params = self.import_query(guild_id, user_ids)
+        return {row[0] for row in await self.read(query, params)}
+
+    async def import_birthdays(self, guild_id, actor, rows, *, csv_sharing=False):
+        from .csv_import import MAX_ROWS, validate_row
+
+        if not rows or len(rows) > MAX_ROWS or len({row.user_id for row in rows}) != len(rows):
+            raise ValueError("Invalid import batch size or duplicate members.")
+        for row in rows:
+            validate_row(row)
+        async with self.transaction() as conn:
+            settings = await (
+                await conn.execute("SELECT * FROM guilds WHERE guild_id=?", (guild_id,))
+            ).fetchone()
+            if not settings:
+                raise ValueError("This server is no longer configured.")
+            ids = [row.user_id for row in rows]
+            query, params = self.import_query(guild_id, ids)
+            existing = {row[0] for row in await (await conn.execute(query, params)).fetchall()}
+            complete, pending = [], []
+            now = datetime.now(UTC).timestamp()
+            for row in rows:
+                if row.user_id in existing:
+                    continue
+                consent = bool(csv_sharing and row.consent is True)
+                if row.timezone:
+                    complete.append(
+                        (
+                            guild_id,
+                            row.user_id,
+                            row.month,
+                            row.day,
+                            row.timezone,
+                            settings["hour"],
+                            settings["minute"],
+                            settings["leap"],
+                            consent,
+                            now,
+                        )
+                    )
+                else:
+                    pending.append(
+                        (guild_id, row.user_id, row.month, row.day, None, consent, now, actor)
+                    )
+            await conn.executemany("INSERT INTO birthdays VALUES (?,?,?,?,?,?,?,?,?,?)", complete)
+            await conn.executemany(
+                "INSERT INTO birthday_import_pending VALUES (?,?,?,?,?,?,?,?)", pending
+            )
+            if complete:
+                await self._invalidate_directories(conn, guild_id)
+        return len(complete), len(pending), len(existing)
+
     async def save(self, guild_id, user_id, month, day, zone, hour, minute, leap, consent):
         from datetime import time
 
@@ -249,6 +325,10 @@ class Database:
                 ),
             )
             await self._invalidate_directories(conn, guild_id)
+            await conn.execute(
+                "DELETE FROM birthday_import_pending WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            )
             # Pending greetings follow the latest date, timezone and opt-out.
             # Sent, blocked and ambiguous jobs remain as annual anti-spam receipts.
             await conn.execute(
@@ -347,6 +427,10 @@ class Database:
 
     async def forget(self, guild_id, user_id):
         async with self.transaction() as conn:
+            await conn.execute(
+                "DELETE FROM birthday_import_pending WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id),
+            )
             # Preserve unresolved send markers until their public post can be found
             # and scheduled for deletion; the private birthday itself is erased.
             await conn.execute(

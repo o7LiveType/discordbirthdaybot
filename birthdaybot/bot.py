@@ -89,6 +89,9 @@ class BirthdayBot(discord.AutoShardedClient):
         self.close_lock = asyncio.Lock()
         self.live_clock = True
         self.queue = WorkQueue()
+        self.import_sessions = {}
+        self.import_tasks = set()
+        self.import_slots = asyncio.Semaphore(2)
         self.active_views = OrderedDict()
         self.directory_views = OrderedDict()
         self.directory_refreshes = OrderedDict()
@@ -158,6 +161,8 @@ class BirthdayBot(discord.AutoShardedClient):
             for view in self.active_views.values():
                 view.stop()
             self.active_views.clear()
+            await asyncio.gather(*self.import_tasks, return_exceptions=True)
+            self.import_tasks.clear()
             for view in self.directory_views.values():
                 view.stop()
             self.directory_views.clear()

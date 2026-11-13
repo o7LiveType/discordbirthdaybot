@@ -1,5 +1,6 @@
 """Exercise menu paths without a Discord token or network calls."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -38,6 +39,7 @@ async def menu(db):
         await bot.queue.close()
         for view in bot.active_views.values():
             view.stop()
+        await asyncio.gather(*bot.import_tasks, return_exceptions=True)
 
 
 async def click(bot, value, label):
@@ -524,3 +526,269 @@ async def test_search_button_cannot_open_for_wrong_owner_or_expired_menu(menu):
     await search.callback(value)
     value.response.send_modal.assert_not_awaited()
     assert "expired" in value.followup.send.call_args.args[0]
+
+
+async def importer(menu):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    value.guild.id = 1
+    value.guild.get_member.return_value = None
+
+    async def member(user_id):
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member = AsyncMock(side_effect=member)
+    await bot.menu_actions["import"](value)
+    return bot, value, bot.active_views[(1, 20)]
+
+
+async def upload_csv(bot, value, view, data, *, filename="birthdays.csv", wait=True):
+    await next(
+        item for item in view.children if getattr(item, "label", None) == "Upload CSV"
+    ).callback(value)
+    modal = value.response.send_modal.call_args.args[0]
+    modal.upload._values = [
+        SimpleNamespace(filename=filename, size=len(data), read=AsyncMock(return_value=data))
+    ]
+    await modal.on_submit(value)
+    if wait and view.job:
+        await view.job
+    return modal
+
+
+async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
+    from birthdaybot.csv_import import parse_csv
+
+    bot, value, view = await importer(menu)
+    first, second = 111111111111111111, 222222222222222222
+    data = f"user_id,month,day,timezone,opt_out\n{first},2,29,UTC,false\n{second},3,4,,false\n".encode()
+    modal = await upload_csv(bot, value, view, data)
+    assert modal.to_components()[0]["component"]["type"] == discord.ComponentType.file_upload.value
+    assert view.phase == "ready" and view.ready()
+    assert await bot.db.birthday(1, first) is None
+    assert await bot.db.pending_birthday(1, second) is None
+    await view.confirm(value)  # Explicit review is required first.
+    assert await bot.db.birthday(1, first) is None
+    await click(bot, value, "Review import")
+    assert (
+        "0 birthdays will have public sharing"
+        in value.edit_original_response.call_args.kwargs["content"]
+    )
+    await click(bot, value, "Confirm import")
+    assert (await bot.db.birthday(1, first))["consent"] == 0
+    assert await bot.db.birthday(1, second) is None
+    assert (await bot.db.pending_birthday(1, second))["timezone"] is None
+    assert (await bot.db.directory(1))["visible"] == 0
+    assert view.parsed is None and not bot.import_sessions
+    # Imported dates without zones are prefilled for the member, never silently UTC.
+    value.user.id = second
+    await bot.menu_actions["update"](value)
+    draft = bot.active_views[(1, second)]
+    assert (draft.month, draft.day) == (3, 4) and not draft.zone_valid
+    with pytest.raises(ValueError):
+        await draft.save(value)
+    assert next(item for item in draft.children if getattr(item, "label", None) == "Save").disabled
+    await choose(draft, value, 2, "Asia/Kathmandu")
+    assert draft.zone_valid
+    await draft.save(value)
+    assert (await bot.db.birthday(1, second))["timezone"] == "Asia/Kathmandu"
+    assert await bot.db.pending_birthday(1, second) is None
+    assert (await bot.db.birthday(1, second))["consent"] == 0
+    assert not hasattr(parse_csv(data).rows[0], "year")
+
+
+async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(menu):
+    bot, value, view = await importer(menu)
+    first, second = 111111111111111111, 222222222222222222
+    data = f"user_id,month,day,timezone,consent\n{first},1,1,UTC,true\n{second},2,2,UTC,true\n".encode()
+    await upload_csv(bot, value, view, data)
+    await click(bot, value, "CSV sharing: OFF")
+    await click(bot, value, "Review import")
+    assert (
+        "2 birthdays will have public sharing"
+        in value.edit_original_response.call_args.kwargs["content"]
+    )
+    await bot.db.save(1, second, 9, 9, "Asia/Tokyo", 0, 0, "feb28", False)
+    await click(bot, value, "Confirm import")
+    assert (await bot.db.birthday(1, first))["consent"] == 1
+    assert (await bot.db.birthday(1, second))["month"] == 9
+    assert (await bot.db.birthday(1, second))["consent"] == 0
+    assert (
+        "1 newly existing records skipped"
+        in value.edit_original_response.call_args.kwargs["content"]
+    )
+
+
+async def test_import_verifies_members_and_skips_existing_and_departed_users(menu):
+    from birthdaybot.commands import PrivateList
+
+    bot, value, view = await importer(menu)
+    first, second, third = 111111111111111111, 222222222222222222, 333333333333333333
+    await bot.db.save(1, first, 8, 8, "UTC", 0, 0, "feb28", False)
+
+    async def lookup(user_id):
+        if user_id == second:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "missing")
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member.side_effect = lookup
+    data = (
+        "user_id,month,day\n" + "".join(f"{user},1,1\n" for user in (first, second, third))
+    ).encode()
+    await upload_csv(bot, value, view, data)
+    assert view.statuses == {first: "existing", second: "left", third: "member"}
+    assert value.guild.fetch_member.await_count == 2
+    await click(bot, value, "Review import")
+    await click(bot, value, "Confirm import")
+    assert (await bot.db.birthday(1, first))["month"] == 8
+    assert await bot.db.pending_birthday(1, second) is None
+    assert await bot.db.pending_birthday(1, third)
+    listing = await PrivateList(bot, 20, 1).render()
+    assert "NEEDS TIMEZONE" in listing and str(third) in listing
+
+
+async def test_import_failed_member_checks_block_commit_and_support_retry(menu):
+    bot, value, view = await importer(menu)
+    first, second = 111111111111111111, 222222222222222222
+    value.guild.fetch_member.side_effect = OSError("unavailable")
+    data = f"user_id,month,day,timezone\n{first},1,1,UTC\n{second},2,2,UTC\n".encode()
+    await upload_csv(bot, value, view, data)
+    assert set(view.statuses.values()) == {"unverified"}
+    assert value.guild.fetch_member.await_count == 1  # Don't hammer a failing API.
+    assert not view.ready()
+    await view.confirm(value)
+    assert not await bot.db.read("SELECT * FROM birthdays")
+
+    async def lookup(user_id):
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member.side_effect = lookup
+    await click(bot, value, "Retry verification")
+    await view.job
+    assert view.ready()
+
+
+async def test_import_csv_errors_never_start_member_checks_and_upload_can_retry(menu):
+    bot, value, view = await importer(menu)
+    first = 111111111111111111
+    await upload_csv(bot, value, view, f"user_id,month,day\n{first},4,31\n".encode())
+    assert view.phase == "invalid" and not view.ready()
+    value.guild.fetch_member.assert_not_awaited()
+    await upload_csv(bot, value, view, f"user_id,month,day\n{first},4,30\n".encode())
+    assert view.ready()
+    assert await bot.db.pending_birthday(1, first) is None
+
+
+async def test_import_permission_revocation_blocks_upload_and_final_confirmation(menu):
+    bot, value, view = await importer(menu)
+    data = b"user_id,month,day,timezone\n111111111111111111,1,1,UTC\n"
+    await upload_csv(bot, value, view, data)
+    await click(bot, value, "Review import")
+    value.user.guild_permissions = discord.Permissions.none()
+    await view.confirm(value)
+    assert not await bot.db.read("SELECT * FROM birthdays")
+    from birthdaybot.import_ui import ImportUpload
+
+    modal = ImportUpload(view)
+    file = SimpleNamespace(filename="data.csv", size=len(data), read=AsyncMock(return_value=data))
+    modal.upload._values = [file]
+    await modal.on_submit(value)
+    file.read.assert_not_awaited()
+
+
+async def test_import_upload_checks_limits_before_reading_and_menu_cancel_cancels_work(menu):
+    from birthdaybot.csv_import import MAX_BYTES
+
+    bot, value, view = await importer(menu)
+    modal = await upload_csv(bot, value, view, b"bad", filename="data.zip")
+    modal.upload.values[0].read.assert_not_awaited()
+    modal.upload._values = [
+        SimpleNamespace(filename="data.csv", size=MAX_BYTES + 1, read=AsyncMock())
+    ]
+    await modal.on_submit(value)
+    modal.upload.values[0].read.assert_not_awaited()
+    started, hold = asyncio.Event(), asyncio.Event()
+
+    async def blocked(user_id):
+        started.set()
+        await hold.wait()
+
+    value.guild.fetch_member.side_effect = blocked
+    await upload_csv(bot, value, view, b"user_id,month,day\n111111111111111111,1,1\n", wait=False)
+    await started.wait()
+    assert not bot.queue.pending  # Background work doesn't occupy an interaction worker.
+    await click(bot, value, "Cancel / Server tools")
+    await asyncio.gather(view.job, return_exceptions=True)
+    assert view.job.cancelled() and view.parsed is None
+    assert not bot.import_sessions
+    assert not await bot.db.read("SELECT * FROM birthday_import_pending")
+
+
+async def test_import_global_session_limit_and_cancellation_release_capacity(menu):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    for guild in (1, 2, 3):
+        value.guild_id = guild
+        await bot.menu_actions["import"](value)
+    assert len(bot.import_sessions) == 3
+    value.guild_id = 4
+    await bot.menu_actions["import"](value)
+    assert "busy" in value.followup.send.call_args.args[0]
+    assert 4 not in bot.import_sessions
+    bot.import_sessions[1].stop()
+    await bot.menu_actions["import"](value)
+    assert 4 in bot.import_sessions and len(bot.import_sessions) == 3
+
+
+async def test_csv_import_does_not_log_dates_years_names_or_filenames(menu, caplog):
+    import logging
+
+    bot, value, view = await importer(menu)
+    data = b"user_id,month,day,timezone,opt_out,year,name\n111111111111111111,12,23,UTC,true,1987,PrivateCSVPerson\n"
+    with caplog.at_level(logging.INFO):
+        await upload_csv(bot, value, view, data, filename="PrivateCSVPerson.csv")
+        await click(bot, value, "Review import")
+        await click(bot, value, "Confirm import")
+    assert "csv_imported" in caplog.text
+    assert all(value not in caplog.text for value in ("PrivateCSVPerson", "1987", "12/23", "UTC"))
+
+
+async def test_csv_member_lookups_are_bounded_across_servers(menu):
+    from birthdaybot.csv_import import parse_csv
+    from birthdaybot.import_ui import ImportView
+
+    bot, _ = menu
+    active, peak, entered = 0, 0, 0
+    enough, release = asyncio.Event(), asyncio.Event()
+    views = []
+    rows = parse_csv(b"user_id,month,day\n111111111111111111,1,1\n")
+    for guild in (1, 2, 3):
+        await bot.db.ensure_guild(guild)
+        value = MagicMock()
+        value.guild_id, value.guild.id = guild, guild
+        value.edit_original_response = AsyncMock()
+        value.response.is_done.return_value = True
+
+        async def lookup(user_id, guild_id=guild):
+            nonlocal active, peak, entered
+            active += 1
+            entered += 1
+            peak = max(peak, active)
+            if entered == 2:
+                enough.set()
+            try:
+                await release.wait()
+                return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=guild_id))
+            finally:
+                active -= 1
+
+        value.guild.fetch_member = AsyncMock(side_effect=lookup)
+        view = ImportView(bot, 20, guild)
+        bot.track_view(view, guild, 20)
+        view.load(value, rows)
+        views.append(view)
+    await asyncio.wait_for(enough.wait(), 1)
+    assert peak == 2 and entered == 2
+    release.set()
+    await asyncio.gather(*(view.job for view in views))
+    assert peak == 2 and all(view.ready() for view in views)

@@ -436,24 +436,35 @@ class TimezoneBrowser:
 
 class BirthdayWizard(OwnedView):
     def __init__(
-        self, bot, owner, guild_id, settings, record=None, zone=None, opt_out=None, update=False
+        self,
+        bot,
+        owner,
+        guild_id,
+        settings,
+        record=None,
+        zone=None,
+        opt_out=None,
+        update=False,
+        timezone_verified=True,
     ):
         super().__init__(owner, queue=bot.queue)
         self.bot, self.guild_id, self.update = bot, guild_id, update
         self.month = record["month"] if record else None
         self.day = record["day"] if record else None
-        self.zone = zone or (record["timezone"] if record else settings["timezone"])
+        self.zone = zone or (record["timezone"] if record else None) or settings["timezone"]
         self.opt_out = (
             opt_out if opt_out is not None else (not record["consent"] if record else False)
         )
         self.day_page = int(bool(self.day and self.day >= 25))
         self.completed = False
         self.public_birthdays = bool(settings["public_birthdays"])
-        self.zone_valid = True
+        self.zone_valid = bool(timezone_verified)
         self.browsing_zone = False
         self.zone_browser = TimezoneBrowser(self)
         self.zone_notice = (
             "✅ Valid timezone. The offset shown is current; daylight saving is automatic."
+            if self.zone_valid
+            else "⚠️ Your birthday was imported without a timezone. Choose your timezone below, then Save to confirm your imported details."
         )
         self.build()
 

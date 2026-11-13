@@ -58,16 +58,17 @@ class PrivateList(OwnedView):
         # Requery on every click: don't retain deleted private records in menus.
         total = (
             await self.bot.db.read(
-                "SELECT count(*) FROM birthdays WHERE guild_id=?", (self.guild_id,)
+                "SELECT (SELECT count(*) FROM birthdays WHERE guild_id=?)+(SELECT count(*) FROM birthday_import_pending WHERE guild_id=?)",
+                (self.guild_id, self.guild_id),
             )
         )[0][0]
         self.page = max(0, min(self.page, (total - 1) // 10))
         values = await self.bot.db.read(
-            "SELECT * FROM birthdays WHERE guild_id=? ORDER BY month,day,user_id LIMIT 10 OFFSET ?",
-            (self.guild_id, self.page * 10),
+            "SELECT user_id,month,day,timezone,hour,minute,consent,leap,0 AS pending FROM birthdays WHERE guild_id=? UNION ALL SELECT p.user_id,p.month,p.day,p.timezone,g.hour,g.minute,p.consent,g.leap,1 FROM birthday_import_pending p JOIN guilds g ON g.guild_id=p.guild_id WHERE p.guild_id=? ORDER BY month,day,user_id LIMIT 10 OFFSET ?",
+            (self.guild_id, self.guild_id, self.page * 10),
         )
         lines = [
-            f"<@{r['user_id']}> · {r['month']:02}/{r['day']:02} · {r['timezone']} · "
+            f"<@{r['user_id']}> · {r['month']:02}/{r['day']:02} · {r['timezone'] or 'NEEDS TIMEZONE'}{' (pending import)' if r['pending'] else ''} · "
             f"{r['hour']:02}:{r['minute']:02} · {'public' if r['consent'] else 'private'} · {r['leap']}"
             for r in values
         ]
@@ -376,7 +377,12 @@ def install(bot):
     async def open_member(interaction, *, update):
         settings = await bot.db.guild(interaction.guild_id)
         record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
-        if update and not record:
+        pending = (
+            await bot.db.pending_birthday(interaction.guild_id, interaction.user.id)
+            if not record
+            else None
+        )
+        if update and not record and not pending:
             await result(
                 interaction, "You haven't set a birthday yet. Choose Set birthday in the main menu."
             )
@@ -388,7 +394,13 @@ def install(bot):
             )
             return
         view = BirthdayWizard(
-            bot, interaction.user.id, interaction.guild_id, settings, record, update=update
+            bot,
+            interaction.user.id,
+            interaction.guild_id,
+            settings,
+            record or pending,
+            update=update and record is not None,
+            timezone_verified=not pending,
         )
         await show(bot, interaction, view.content(), view)
 
@@ -404,6 +416,9 @@ def install(bot):
     async def me(interaction):
         record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
         if not record:
+            if await bot.db.pending_birthday(interaction.guild_id, interaction.user.id):
+                await open_member(interaction, update=False)
+                return
             await result(
                 interaction,
                 "You have no birthday saved here. Choose Set birthday in the main menu.",
@@ -459,6 +474,7 @@ def install(bot):
             ("Pause / resume", "pause", 1),
             ("Channel deliveries", "channel_deliveries", 2),
             ("DM deliveries", "dm_deliveries", 2),
+            ("Import birthdays", "import", 3),
             ("Main menu", "home", 3),
         ]
         for label, name, row in actions:
@@ -469,6 +485,25 @@ def install(bot):
             "**Server tools**\nManage Server permission is required for every action.",
             view,
         )
+
+    @action("import", admin=True)
+    async def import_birthdays(interaction):
+        from .import_ui import ImportView
+
+        if interaction.guild_id in bot.import_sessions:
+            await private(
+                interaction,
+                "An import is already open for this server. Finish or cancel it first, or wait for its menu to expire.",
+            )
+            return
+        if len(bot.import_sessions) >= 3:
+            await private(
+                interaction,
+                "The import slots are busy. Please try again after another import finishes.",
+            )
+            return
+        view = ImportView(bot, interaction.user.id, interaction.guild_id)
+        await show(bot, interaction, view.content(), view)
 
     @action("setup", admin=True)
     async def setup(interaction):

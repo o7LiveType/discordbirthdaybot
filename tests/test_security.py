@@ -87,6 +87,7 @@ async def test_actual_command_callbacks_reject_every_admin_action():
         "status",
         "channel_deliveries",
         "dm_deliveries",
+        "import",
     }
     for name in bot.admin_actions:
         with pytest.raises(app_commands.MissingPermissions):
