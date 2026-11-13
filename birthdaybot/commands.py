@@ -559,7 +559,7 @@ def install(bot):
             embed=manager_embed("Server config"),
             file=discord.File(
                 io.BytesIO(config_document(settings, bot.config.gif)),
-                filename=f"birthdaybot-config-{interaction.guild_id}.json",
+                filename=f"birthdaybot-config-{interaction.guild_id}.csv",
             ),
         )
         log.info(

@@ -1,7 +1,8 @@
 """Exercise menu paths without a Discord token or network calls."""
 
 import asyncio
-import json
+import csv
+import io
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -228,21 +229,27 @@ async def test_server_config_export_is_private_complete_and_server_scoped(menu, 
     assert args["ephemeral"]
     assert args["allowed_mentions"].to_dict() == {"parse": []}
     assert args["embed"].title == "Server config"
-    assert args["file"].filename == "birthdaybot-config-1.json"
+    assert args["file"].filename == "birthdaybot-config-1.csv"
     raw = args["file"].fp.read()
-    document = json.loads(raw)
+    documents = list(csv.DictReader(io.StringIO(raw.decode("utf-8"))))
+    assert len(documents) == 1
+    document = documents[0]
     assert document["guild_id"] == "1"
-    assert document["settings"] == {
+    assert {
+        key: val
+        for key, val in document.items()
+        if key not in {"format", "version", "exported_at", "guild_id"}
+    } == {
         "channel_id": str(channel),
         "alert_channel_id": str(alerts),
         "timezone": "UTC",
-        "hour": 18,
-        "minute": 45,
-        "enabled": False,
+        "hour": "18",
+        "minute": "45",
+        "enabled": "false",
         "gif": "https://static.klipy.com/server.gif",
         "leap": "mar1",
-        "public_birthdays": False,
-        "ping_everyone": True,
+        "public_birthdays": "false",
+        "ping_everyone": "true",
     }
     assert all(
         secret not in raw
@@ -774,7 +781,7 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     await click(bot, value, "Review import")
     assert "Public list: 0 · pending: 0" in response_text(value)
     assert "Server posts: 0 · pending: 0" in response_text(value)
-    await click(bot, value, "Confirm import")
+    await click(bot, value, "Replace birthday list")
     assert (await bot.db.birthday(1, first))["consent"] == 0
     assert await bot.db.birthday(1, second) is None
     assert (await bot.db.pending_birthday(1, second))["timezone"] is None
@@ -797,7 +804,7 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     assert not hasattr(parse_csv(data).rows[0], "year")
 
 
-async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(menu):
+async def test_import_csv_overwrites_concurrent_edits_at_confirmation(menu):
     bot, value, view = await importer(menu)
     first, second = 111111111111111111, 222222222222222222
     data = f"user_id,month,day,timezone,consent\n{first},1,1,UTC,true\n{second},2,2,UTC,true\n".encode()
@@ -806,11 +813,55 @@ async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(m
     for label in ("Public list", "Server posts", "Birthday DMs", "Post mentions"):
         assert f"{label}: 2 · pending: 0" in response_text(value)
     await bot.db.save(1, second, 9, 9, "Asia/Tokyo", 0, 0, "feb28", False)
-    await click(bot, value, "Confirm import")
+    await click(bot, value, "Replace birthday list")
     assert (await bot.db.birthday(1, first))["consent"] == 1
-    assert (await bot.db.birthday(1, second))["month"] == 9
-    assert (await bot.db.birthday(1, second))["consent"] == 0
-    assert "Additional skips: 1" in response_text(value)
+    assert (await bot.db.birthday(1, second))["month"] == 2
+    assert (await bot.db.birthday(1, second))["consent"] == 1
+    assert "Added: 1 · Updated: 1 · Removed: 0" in response_text(value)
+
+
+async def test_reupload_updates_existing_dates_and_optouts_and_removes_missing_members(menu):
+    from birthdaybot.sharing import Sharing
+
+    bot, value, view = await importer(menu)
+    first, second = 111111111111111111, 222222222222222222
+    await bot.db.save(1, first, 1, 1, "UTC", 0, 0, "feb28", True)
+    await bot.db.save(1, second, 2, 2, "UTC", 0, 0, "feb28", True)
+    await upload_csv(
+        bot,
+        value,
+        view,
+        f"user_id,month,day,timezone,opt_out\n{first},7,15,Europe/Bucharest,true\n".encode(),
+    )
+    assert view.ready()  # Files containing only existing users are valid replacements.
+    assert value.guild.fetch_member.await_count == 1
+    await click(bot, value, "Review import")
+    assert "Add: 0 · Update: 1 · Remove: 1" in response_text(value)
+    assert "Server posts: 0 · pending: 0" in response_text(value)
+    assert await bot.db.birthday(1, second) is not None
+    await click(bot, value, "Replace birthday list")
+    record = await bot.db.birthday(1, first)
+    assert (record["month"], record["day"], record["timezone"]) == (7, 15, "Europe/Bucharest")
+    assert Sharing.from_record(record) == Sharing.all(False)
+    assert await bot.db.birthday(1, second) is None
+    assert "Added: 0 · Updated: 1 · Removed: 1" in response_text(value)
+
+
+async def test_header_only_replacement_requires_review_and_clears_only_this_server(menu):
+    bot, value, view = await importer(menu)
+    await bot.db.save(1, 10, 1, 1, "UTC", 0, 0, "feb28", True)
+    await bot.db.ensure_guild(2)
+    await bot.db.save(2, 10, 2, 2, "UTC", 0, 0, "feb28", True)
+    await upload_csv(bot, value, view, b"user_id,month,day,timezone,opt_out\n")
+    assert view.ready()
+    value.guild.fetch_member.assert_not_awaited()
+    await view.confirm(value)
+    assert await bot.db.birthday(1, 10)
+    await click(bot, value, "Review import")
+    assert "Add: 0 · Update: 0 · Remove: 1" in response_text(value)
+    await click(bot, value, "Replace birthday list")
+    assert await bot.db.birthday(1, 10) is None
+    assert await bot.db.birthday(2, 10)
 
 
 async def test_import_granular_sharing_drafts_preview_and_committed_permissions_match(menu):
@@ -854,8 +905,8 @@ async def test_import_granular_sharing_drafts_preview_and_committed_permissions_
     assert "Birthday DMs: 0 · pending: 0" in response_text(value)
     assert "Post mentions: 1 · pending: 0" in response_text(value)
     assert "Everyone ping: On" in response_text(value)
-    assert "Existing records and sharing are unchanged" in response_text(value)
-    await click(bot, value, "Confirm import")
+    assert "Removes birthdays absent from this CSV" in response_text(value)
+    await click(bot, value, "Replace birthday list")
     assert Sharing.from_record(await bot.db.birthday(1, first)) == Sharing(True, True, False, True)
     assert Sharing.from_record(await bot.db.pending_birthday(1, second)) == Sharing(
         True, False, False, False
@@ -897,7 +948,7 @@ async def test_import_sharing_changes_require_new_review_and_revoked_access_is_b
     assert not await bot.db.read("SELECT * FROM birthdays")
     await click(bot, value, "Review import")
     assert "Server posts: 0 · pending: 0" in response_text(value)
-    await click(bot, value, "Confirm import")
+    await click(bot, value, "Replace birthday list")
     assert not (await bot.db.birthday(1, 111111111111111111))["announce"]
 
 
@@ -934,7 +985,7 @@ async def test_large_granular_import_preview_stays_within_discord_embed_limits(m
     assert not await bot.db.read("SELECT * FROM birthdays")
 
 
-async def test_import_verifies_members_and_skips_existing_and_departed_users(menu):
+async def test_import_verifies_existing_members_and_blocks_departed_rows(menu):
     from birthdaybot.commands import PrivateList
 
     bot, value, view = await importer(menu)
@@ -951,12 +1002,19 @@ async def test_import_verifies_members_and_skips_existing_and_departed_users(men
         "user_id,month,day\n" + "".join(f"{user},1,1\n" for user in (first, second, third))
     ).encode()
     await upload_csv(bot, value, view, data)
-    assert view.statuses == {first: "existing", second: "left", third: "member"}
-    assert "Skipped: existing birthday and sharing unchanged." in response_text(value)
-    assert value.guild.fetch_member.await_count == 2
-    await click(bot, value, "Review import")
-    await click(bot, value, "Confirm import")
+    assert view.statuses == {first: "member", second: "left", third: "member"}
+    assert "Remove this row before replacing the list" in response_text(value)
+    assert value.guild.fetch_member.await_count == 3
+    assert not view.ready()
+    await view.review(value)
+    assert "verify every listed member" in value.followup.send.call_args.args[0]
     assert (await bot.db.birthday(1, first))["month"] == 8
+    # Correct the file; a missing timezone replaces an active date with pending data.
+    await upload_csv(bot, value, view, f"user_id,month,day\n{first},1,1\n{third},1,1\n".encode())
+    await click(bot, value, "Review import")
+    await click(bot, value, "Replace birthday list")
+    assert await bot.db.birthday(1, first) is None
+    assert (await bot.db.pending_birthday(1, first))["month"] == 1
     assert await bot.db.pending_birthday(1, second) is None
     assert await bot.db.pending_birthday(1, third)
     listing = await PrivateList(bot, 20, 1).render()
@@ -1064,7 +1122,7 @@ async def test_csv_import_does_not_log_dates_years_names_or_filenames(menu, capl
     with caplog.at_level(logging.INFO):
         await upload_csv(bot, value, view, data, filename="PrivateCSVPerson.csv")
         await click(bot, value, "Review import")
-        await click(bot, value, "Confirm import")
+        await click(bot, value, "Replace birthday list")
     assert "csv_imported" in caplog.text
     assert all(value not in caplog.text for value in ("PrivateCSVPerson", "1987", "12/23", "UTC"))
 

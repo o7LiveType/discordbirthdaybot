@@ -112,11 +112,7 @@ class ImportView(OwnedView):
             self.phase == "ready"
             and self.parsed
             and not self.parsed.issues
-            and all(
-                self.statuses.get(row.user_id) in {"member", "existing", "left"}
-                for row in self.parsed.rows
-            )
-            and any(state == "member" for state in self.statuses.values())
+            and all(self.statuses.get(row.user_id) == "member" for row in self.parsed.rows)
         )
 
     def build(self):
@@ -208,16 +204,17 @@ class ImportView(OwnedView):
                     "Required: `user_id`, `month`, `day`",
                     "Optional: `timezone` (IANA), `opt_out`, `list_public`, `announce`, `dm_enabled`, `mention_enabled`",
                     "Sharing flags: true/false. `opt_out=true` disables all four.",
-                    "Existing records skipped. Missing timezone → pending.",
+                    "Replaces this server's complete birthday list. Missing rows are removed.",
+                    "Missing timezone → pending. Header-only CSV clears the list.",
                 ]
             )
         counts = {
             state: list(self.statuses.values()).count(state)
-            for state in {"member", "existing", "left", "unverified"}
+            for state in {"member", "left", "unverified"}
         }
         lines += [
             f"{self.parsed.total} rows · {len(self.parsed.issues)} errors · {self.phase}",
-            f"Verified members: {counts['member']} · existing: {counts['existing']} · departed/not found: {counts['left']} · unverified: {counts['unverified']}",
+            f"Verified members: {counts['member']} · not in server: {counts['left']} · unverified: {counts['unverified']}",
             f"Checked: {len(self.statuses)}/{len(self.parsed.rows)} · ignored columns: {self.parsed.ignored_columns}",
         ]
         if self.parsed.issues:
@@ -237,10 +234,8 @@ class ImportView(OwnedView):
     def row_content(self, row):
         state = self.statuses.get(row.user_id, "waiting")
         line = f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'Timezone required'} · {state}\n"
-        if state == "existing":
-            return line + "Skipped: existing birthday and sharing unchanged."
         if state == "left":
-            return line + "Skipped: not in this server."
+            return line + "Not in this server. Remove this row before replacing the list."
         return line + " · ".join(
             f"{label}: {'On' if enabled else 'Off'}"
             for label, enabled in zip(
@@ -319,15 +314,10 @@ class ImportView(OwnedView):
     async def verify(self, interaction):
         try:
             parsed = self.parsed
-            existing = await self.bot.db.import_existing(
-                self.guild_id, [row.user_id for row in parsed.rows]
-            )
             for row in parsed.rows:
                 if self.is_finished():
                     return
-                if row.user_id in existing:
-                    self.statuses[row.user_id] = "existing"
-                elif row.user_id not in self.statuses:
+                if row.user_id not in self.statuses:
                     try:
                         async with self.bot.import_slots:
                             async with asyncio.timeout(12):
@@ -342,10 +332,7 @@ class ImportView(OwnedView):
                     except (discord.HTTPException, OSError, TimeoutError):
                         self.statuses[row.user_id] = "unverified"
                         for remaining in parsed.rows:
-                            self.statuses.setdefault(
-                                remaining.user_id,
-                                "existing" if remaining.user_id in existing else "unverified",
-                            )
+                            self.statuses.setdefault(remaining.user_id, "unverified")
                         break
             self.phase = "ready"
             log.info(
@@ -375,9 +362,13 @@ class ImportView(OwnedView):
 
     async def review(self, interaction):
         if not self.ready() or self.sharing_draft is not None:
-            await private(interaction, "Verification incomplete or CSV errors remain.")
+            await private(
+                interaction,
+                "Fix CSV errors and verify every listed member before replacing the list.",
+            )
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
+        plan = await self.bot.db.import_plan(self.guild_id, [row.user_id for row in rows])
         self.reviewed = True
         pending = sum(row.timezone is None for row in rows)
         resolved = [(row.timezone is not None, self.sharing.resolve(row)) for row in rows]
@@ -397,13 +388,17 @@ class ImportView(OwnedView):
         if not settings["public_birthdays"]:
             counts.append("Public lists: Moderators only")
         self.clear_items()
-        self.add_item(button("Confirm import", self.confirm, style=discord.ButtonStyle.danger))
+        self.add_item(
+            button("Replace birthday list", self.confirm, style=discord.ButtonStyle.danger)
+        )
         self.add_item(button("Back to preview", self.refresh))
         await edit(
             interaction,
-            content=f"**Confirm import**\nSave: {len(rows) - pending} · Pending timezone: {pending}\n"
+            content="**Replace birthday list**\n"
+            + f"Add: {plan.added} · Update: {plan.updated} · Remove: {plan.removed}\n"
+            + f"Saved: {len(rows) - pending} · Pending timezone: {pending}\n"
             + "\n".join(counts)
-            + "\nExisting records and sharing are unchanged. Departed members skipped.",
+            + "\nOverwrites dates, timezones and sharing. Removes birthdays absent from this CSV.",
             view=self,
         )
 
@@ -420,21 +415,28 @@ class ImportView(OwnedView):
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         async with self.bot.mutation_lock:
-            saved, pending, skipped = await self.bot.db.import_birthdays(
-                self.guild_id, self.owner, rows, sharing=self.sharing
+            if not await self.check_access(interaction):
+                return
+            result = await self.bot.db.import_birthdays(
+                self.guild_id,
+                self.owner,
+                rows,
+                sharing=self.sharing,
             )
         self.completed = True
         log.info(
-            "csv_imported guild=%s actor=%s saved=%s pending=%s raced_skips=%s sharing=%s",
+            "csv_imported guild=%s actor=%s saved=%s pending=%s added=%s updated=%s removed=%s sharing=%s",
             self.guild_id,
             self.owner,
-            saved,
-            pending,
-            skipped,
+            result.saved,
+            result.pending,
+            result.added,
+            result.updated,
+            result.removed,
             {key: getattr(self.sharing, key) for key in FLAGS},
         )
         await edit(
             interaction,
-            content=f"**Import complete**\nSaved: {saved} · Pending timezone: {pending} · Additional skips: {skipped}",
+            content=f"**Birthday list replaced**\nSaved: {result.saved} · Pending timezone: {result.pending}\nAdded: {result.added} · Updated: {result.updated} · Removed: {result.removed}",
             view=navigation(self.bot, self.owner, self.guild_id, admin=True),
         )

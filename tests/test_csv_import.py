@@ -173,12 +173,18 @@ def test_member_ids_reject_unbalanced_mentions_and_lossy_spreadsheet_values(valu
         member_id(value)
 
 
-async def test_import_is_private_by_default_atomic_idempotent_and_server_scoped(db):
+async def test_explicit_private_import_is_atomic_and_reimport_overwrites_sharing(db):
     rows = parse_csv(csv_data(f"{A},2,29,UTC,false", f"{B},3,1,,true")).rows
     await db.ensure_guild(2)
     await db.save(2, A, 7, 7, "UTC", 0, 0, "feb28", True)
     await db.configure(1, None, None, "UTC", 18, 45, "", "mar1")
-    assert await db.import_birthdays(1, C, rows) == (1, 1, 0)
+    assert await db.import_birthdays(1, C, rows, sharing=ImportSharing.all("off")) == (
+        1,
+        1,
+        2,
+        0,
+        0,
+    )
     active = await db.birthday(1, A)
     assert active["consent"] == 0 and active["timezone"] == "UTC"
     assert (active["hour"], active["minute"], active["leap"]) == (18, 45, "mar1")
@@ -186,13 +192,13 @@ async def test_import_is_private_by_default_atomic_idempotent_and_server_scoped(
     assert (await db.pending_birthday(1, B))["timezone"] is None
     assert (await db.directory(1))["visible"] == 0
     assert (await db.birthday(2, A))["month"] == 7
-    assert await db.import_birthdays(1, C, rows, csv_sharing=True) == (0, 0, 2)
-    assert (await db.birthday(1, A))["consent"] == 0
+    assert await db.import_birthdays(1, C, rows) == (1, 1, 0, 2, 0)
+    assert (await db.birthday(1, A))["consent"] == 1
 
 
-async def test_explicit_csv_sharing_requires_the_mode_and_blank_values_remain_private(db):
+async def test_csv_sharing_is_honored_by_default_and_blank_values_remain_private(db):
     rows = parse_csv(csv_data(f"{A},1,1,UTC,false", f"{B},2,2,UTC,", f"{C},3,3,UTC,true")).rows
-    assert await db.import_birthdays(1, A, rows, csv_sharing=True) == (3, 0, 0)
+    assert await db.import_birthdays(1, A, rows) == (3, 0, 3, 0, 0)
     assert (await db.birthday(1, A))["consent"] == 1
     assert (await db.birthday(1, B))["consent"] == 0
     assert (await db.birthday(1, C))["consent"] == 0
@@ -208,15 +214,21 @@ async def test_granular_import_persists_all_combinations_and_pending_choices(db)
     rows = parse_csv(
         csv_data(*records, header="user_id,month,day,timezone," + ",".join(FLAGS))
     ).rows
-    assert await db.import_birthdays(1, C, rows, sharing=ImportSharing()) == (16, 1, 0)
+    assert await db.import_birthdays(1, C, rows, sharing=ImportSharing()) == (16, 1, 17, 0, 0)
     for index, values in enumerate(combinations):
         record = await db.birthday(1, A + index)
         assert Sharing.from_record(record) == Sharing(*values)
         assert bool(record["consent"]) == Sharing(*values).enabled
     assert Sharing.from_record(await db.pending_birthday(1, B)) == Sharing(True, False, True, False)
     assert (await db.directory(1))["visible"] == 8
-    # Re-imports never overwrite a member's previous settings.
-    assert await db.import_birthdays(1, C, rows, sharing=ImportSharing.all("on")) == (0, 0, 17)
+    # Explicit per-field CSV refusals still apply when reimporting with On defaults.
+    assert await db.import_birthdays(1, C, rows, sharing=ImportSharing.all("on")) == (
+        16,
+        1,
+        0,
+        17,
+        0,
+    )
     assert Sharing.from_record(await db.birthday(1, A)) == Sharing.all(False)
 
 
@@ -244,13 +256,14 @@ async def test_import_revalidates_granular_flags_before_writing_any_rows(db):
     assert not await db.read("SELECT * FROM birthdays")
 
 
-async def test_racing_imports_never_overwrite_and_existing_rows_are_rechecked(db):
+async def test_racing_replacements_are_serialized_without_duplicate_records(db):
     row = ImportRow(2, A, 1, 1, "UTC", True)
     outcomes = await asyncio.gather(
         db.import_birthdays(1, C, [row]), db.import_birthdays(1, C, [replace(row, month=2)])
     )
-    assert sum(saved for saved, pending, skipped in outcomes) == 1
-    assert sum(skipped for saved, pending, skipped in outcomes) == 1
+    assert sum(result.saved for result in outcomes) == 2
+    assert sum(result.updated for result in outcomes) == 1
+    assert sum(result.removed for result in outcomes) == 0
     assert await db.import_existing(1, [A, B]) == {A}
 
 
@@ -270,7 +283,7 @@ async def test_import_revalidates_data_and_claiming_or_deleting_removes_pending(
     row = ImportRow(2, A, 2, 29, None, True)
     with pytest.raises(ValueError):
         await db.import_birthdays(1, C, [replace(row, day=31)])
-    await db.import_birthdays(1, C, [row], csv_sharing=True)
+    await db.import_birthdays(1, C, [row])
     await db.save(1, A, 2, 29, "Asia/Kathmandu", 0, 0, "feb28", True)
     assert await db.pending_birthday(1, A) is None
     await db.import_birthdays(1, C, [replace(row, user_id=B)])
@@ -283,7 +296,7 @@ async def test_import_revalidates_data_and_claiming_or_deleting_removes_pending(
 
 async def test_full_500_row_batch_does_not_exceed_old_sqlite_parameter_limit(db):
     rows = [ImportRow(n + 2, A + n, 1, 1, "UTC", None) for n in range(500)]
-    assert await db.import_birthdays(1, C, rows) == (500, 0, 0)
+    assert await db.import_birthdays(1, C, rows) == (500, 0, 500, 0, 0)
     assert len(await db.import_existing(1, [row.user_id for row in rows])) == 500
     assert (await db.read("PRAGMA journal_mode"))[0][0] == "wal"
     assert (await db.read("PRAGMA synchronous"))[0][0] == 2

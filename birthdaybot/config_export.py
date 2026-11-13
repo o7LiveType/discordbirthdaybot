@@ -1,9 +1,11 @@
-"""Versioned, allowlisted exports of saved server settings."""
+"""Versioned, allowlisted CSV exports of saved server settings."""
 
-import json
+import csv
+import io
 from datetime import UTC, datetime
 
 from .config import gif_url
+from .timeutil import timezone
 
 
 def config_document(settings, default_gif):
@@ -13,19 +15,23 @@ def config_document(settings, default_gif):
         "version": 1,
         "exported_at": datetime.now(UTC).isoformat(),
         "guild_id": str(settings["guild_id"]),
-        "settings": {
-            "channel_id": str(settings["channel_id"]) if settings["channel_id"] else None,
-            "alert_channel_id": str(settings["alert_channel_id"])
-            if settings["alert_channel_id"]
-            else None,
-            "timezone": settings["timezone"],
-            "hour": settings["hour"],
-            "minute": settings["minute"],
-            "enabled": bool(settings["enabled"]),
-            "gif": gif_url(gif) if gif else "",
-            "leap": settings["leap"],
-            "public_birthdays": bool(settings["public_birthdays"]),
-            "ping_everyone": bool(settings["ping_everyone"]),
-        },
+        "channel_id": str(settings["channel_id"]) if settings["channel_id"] else "",
+        "alert_channel_id": str(settings["alert_channel_id"])
+        if settings["alert_channel_id"]
+        else "",
+        "timezone": timezone(settings["timezone"]),
+        "hour": settings["hour"],
+        "minute": settings["minute"],
+        "enabled": str(bool(settings["enabled"])).lower(),
+        "gif": gif_url(gif) if gif else "",
+        "leap": settings["leap"],
+        "public_birthdays": str(bool(settings["public_birthdays"])).lower(),
+        "ping_everyone": str(bool(settings["ping_everyone"])).lower(),
     }
-    return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        output, fieldnames=list(document), lineterminator="\n", quoting=csv.QUOTE_ALL
+    )
+    writer.writeheader()
+    writer.writerow(document)
+    return output.getvalue().encode("utf-8")

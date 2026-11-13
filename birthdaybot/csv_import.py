@@ -5,6 +5,7 @@ import csv
 import io
 import re
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from .sharing import FLAGS, Sharing
 from .timeutil import anniversary, timezone
@@ -103,6 +104,21 @@ class ParsedImport:
     total: int
 
 
+@dataclass(frozen=True)
+class ImportPlan:
+    added: int
+    updated: int
+    removed: int
+
+
+class ImportResult(NamedTuple):
+    saved: int
+    pending: int
+    added: int
+    updated: int
+    removed: int
+
+
 def member_id(value):
     match = re.fullmatch(r"(?:<@!?)?([0-9]{1,19})>?", value)
     if not match or value.startswith("<") != value.endswith(">"):
@@ -168,7 +184,9 @@ def parse_csv(data):
                 continue
             total += 1
             if total > MAX_ROWS:
-                raise ValueError("Import at most 500 records at a time; split larger CSV files.")
+                raise ValueError(
+                    "Replacement CSV supports at most 500 records. Include the complete server list in one file."
+                )
             line = reader.line_num
             try:
                 if len(fields) != len(header) or any(len(value) > 2048 for value in fields):
@@ -222,6 +240,4 @@ def parse_csv(data):
         raise ValueError(
             "Malformed CSV. Use a comma-separated UTF-8 file with a header and correctly quoted fields."
         ) from exc
-    if not total:
-        raise ValueError("The CSV contains no birthday records.")
     return ParsedImport(tuple(rows), tuple(issues), len(header) - len(named), total)

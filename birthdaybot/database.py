@@ -331,14 +331,35 @@ class Database:
         query, params = self.import_query(guild_id, user_ids)
         return {row[0] for row in await self.read(query, params)}
 
-    async def import_birthdays(self, guild_id, actor, rows, *, csv_sharing=False, sharing=None):
-        from .csv_import import MAX_ROWS, ImportSharing, validate_row
+    async def import_plan(self, guild_id, user_ids):
+        async with self.transaction(write=False) as conn:
+            return await self._import_plan(conn, guild_id, user_ids)
+
+    async def _import_plan(self, conn, guild_id, user_ids):
+        from .csv_import import ImportPlan
+
+        total = (
+            await (
+                await conn.execute(
+                    "SELECT (SELECT count(*) FROM birthdays WHERE guild_id=?)+(SELECT count(*) FROM birthday_import_pending WHERE guild_id=?)",
+                    (guild_id, guild_id),
+                )
+            ).fetchone()
+        )[0]
+        matched = set()
+        if user_ids:
+            query, parameters = self.import_query(guild_id, user_ids)
+            matched = {row[0] for row in await (await conn.execute(query, parameters)).fetchall()}
+        return ImportPlan(len(user_ids) - len(matched), len(matched), total - len(matched))
+
+    async def import_birthdays(self, guild_id, actor, rows, *, sharing=None):
+        from .csv_import import MAX_ROWS, ImportResult, ImportSharing, validate_row
 
         if sharing is None:
-            sharing = ImportSharing.all("csv" if csv_sharing else "off")
+            sharing = ImportSharing()
         if not isinstance(sharing, ImportSharing):
             raise ValueError("Invalid import sharing settings.")
-        if not rows or len(rows) > MAX_ROWS or len({row.user_id for row in rows}) != len(rows):
+        if len(rows) > MAX_ROWS or len({row.user_id for row in rows}) != len(rows):
             raise ValueError("Invalid import batch size or duplicate members.")
         for row in rows:
             validate_row(row)
@@ -348,14 +369,10 @@ class Database:
             ).fetchone()
             if not settings:
                 raise ValueError("This server is no longer configured.")
-            ids = [row.user_id for row in rows]
-            query, params = self.import_query(guild_id, ids)
-            existing = {row[0] for row in await (await conn.execute(query, params)).fetchall()}
+            plan = await self._import_plan(conn, guild_id, [row.user_id for row in rows])
             complete, pending = [], []
             now = datetime.now(UTC).timestamp()
             for row in rows:
-                if row.user_id in existing:
-                    continue
                 permissions = sharing.resolve(row)
                 consent = permissions.enabled
                 if row.timezone:
@@ -388,6 +405,19 @@ class Database:
                             *permissions.values(),
                         )
                     )
+            # The CSV replaces the complete server list, including active/pending transitions.
+            await conn.execute("DELETE FROM birthdays WHERE guild_id=?", (guild_id,))
+            await conn.execute("DELETE FROM birthday_import_pending WHERE guild_id=?", (guild_id,))
+            # Unsent jobs follow the new data. Preserve receipts, sent/blocked/skipped
+            # jobs and ambiguous sends so replacements cannot repeat celebrations.
+            await conn.execute(
+                "DELETE FROM deliveries WHERE guild_id=? AND state IN ('ready','retry')",
+                (guild_id,),
+            )
+            await conn.execute(
+                "DELETE FROM dm_deliveries WHERE guild_id=? AND state IN ('ready','retry')",
+                (guild_id,),
+            )
             await conn.executemany(
                 "INSERT INTO birthdays(guild_id,user_id,month,day,timezone,hour,minute,leap,consent,updated_at,list_public,announce,dm_enabled,mention_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 complete,
@@ -396,9 +426,8 @@ class Database:
                 "INSERT INTO birthday_import_pending(guild_id,user_id,month,day,timezone,consent,imported_at,imported_by,list_public,announce,dm_enabled,mention_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 pending,
             )
-            if complete:
-                await self._invalidate_directories(conn, guild_id)
-        return len(complete), len(pending), len(existing)
+            await self._invalidate_directories(conn, guild_id)
+        return ImportResult(len(complete), len(pending), plan.added, plan.updated, plan.removed)
 
     async def save(
         self, guild_id, user_id, month, day, zone, hour, minute, leap, consent, *, sharing=None
