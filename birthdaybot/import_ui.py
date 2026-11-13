@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import discord
 
-from .csv_import import MAX_BYTES, ImportSharing, parse_csv
+from .csv_import import MAX_BYTES, ImportIssue, ImportSharing, parse_csv
 from .sharing import FLAGS, LABELS
 from .ui import OwnedView, button, edit, navigation, private
 
@@ -71,6 +71,8 @@ class ImportView(OwnedView):
         self.sharing = ImportSharing()
         self.sharing_draft = None
         self.page, self.completed = 0, False
+        self.issues_only = False
+        self.edit_lock = asyncio.Lock()
         self.reviewed = False
         bot.import_sessions[guild_id] = self
         self.build()
@@ -93,6 +95,7 @@ class ImportView(OwnedView):
             self.job.cancel()
         self.job = None
         self.parsed, self.statuses, self.page = parsed, {}, 0
+        self.issues_only = False
         self.sharing_draft = None
         self.reviewed = False
         self.phase = "invalid" if parsed.issues else "verifying"
@@ -114,6 +117,51 @@ class ImportView(OwnedView):
             and not self.parsed.issues
             and all(self.statuses.get(row.user_id) == "member" for row in self.parsed.rows)
         )
+
+    def can_retry(self):
+        return bool(
+            self.parsed
+            and not self.parsed.issues
+            and self.phase in {"ready", "blocked", "failed"}
+            and not self.ready()
+        )
+
+    def preview_items(self):
+        if self.parsed is None:
+            return ()
+        errors, remaining = list(self.parsed.issues), []
+        for row in self.parsed.rows:
+            if self.issues_only and (
+                self.statuses.get(row.user_id) == "member"
+                or (self.parsed.issues and not self.row_error(row))
+            ):
+                continue
+            (errors if self.row_error(row) else remaining).append(row)
+        return tuple(sorted(errors, key=lambda item: item.line) + remaining)
+
+    def row_error(self, row):
+        state = self.statuses.get(row.user_id)
+        return state in {"left", "unverified"} or (self.phase == "failed" and state != "member")
+
+    def blocking_reason(self):
+        if self.parsed is None:
+            return ""
+        if self.parsed.issues:
+            return "Review blocked: fix the CSV errors and upload again."
+        if self.phase == "verifying":
+            return "Verification in progress. Refresh preview to check progress."
+        if self.phase == "failed":
+            return "Verification failed. Use Retry verification."
+        reasons = []
+        left = sum(state == "left" for state in self.statuses.values())
+        unchecked = sum(
+            self.statuses.get(row.user_id) not in {"member", "left"} for row in self.parsed.rows
+        )
+        if left:
+            reasons.append(f"{left} not in server: check IDs or remove these rows")
+        if unchecked:
+            reasons.append(f"{unchecked} unchecked: use Retry verification")
+        return "Review blocked: " + "; ".join(reasons) + "." if reasons else ""
 
     def build(self):
         self.clear_items()
@@ -146,6 +194,8 @@ class ImportView(OwnedView):
             self.add_item(button("Back", self.cancel_sharing, row=4))
             self.add_item(button("All off", self.private_sharing, row=4))
             return
+        count = len(self.preview_items())
+        self.page = max(0, min(self.page, max(0, (count - 1) // 10)))
         self.add_item(button("Upload CSV", self.upload, row=0, opens_modal=True))
         self.add_item(button("CSV template", self.template, row=0))
         self.add_item(button("Refresh preview", self.refresh, row=0))
@@ -155,10 +205,17 @@ class ImportView(OwnedView):
                 "Next",
                 self.next,
                 row=1,
-                disabled=not self.parsed
-                or (self.page + 1) * 10 >= max(len(self.parsed.rows), len(self.parsed.issues)),
+                disabled=(self.page + 1) * 10 >= count,
             )
         )
+        if self.parsed:
+            self.add_item(
+                button(
+                    "Show all rows" if self.issues_only else "Show issues",
+                    self.toggle_issues,
+                    row=1,
+                )
+            )
         self.add_item(
             button(
                 "Sharing",
@@ -172,7 +229,7 @@ class ImportView(OwnedView):
                 "Retry verification",
                 self.retry,
                 row=2,
-                disabled=self.phase != "ready" or "unverified" not in self.statuses.values(),
+                disabled=not self.can_retry(),
             )
         )
         self.add_item(
@@ -181,7 +238,7 @@ class ImportView(OwnedView):
                 self.review,
                 row=3,
                 style=discord.ButtonStyle.success,
-                disabled=not self.ready(),
+                disabled=self.parsed is None,
             )
         )
         self.add_item(button("Cancel / Server tools", self.bot.menu_actions["tools"], row=3))
@@ -190,16 +247,15 @@ class ImportView(OwnedView):
         if self.sharing_draft is not None:
             return "**Import sharing**\nOff: disabled. On: enabled unless CSV opts out.\nFrom CSV: use flags; blank stays off.\n`opt_out=true` disables all four."
         lines = ["**Import birthdays**"]
-        lines += [
-            " · ".join(
-                f"{label}: {MODES[getattr(self.sharing, key)]}"
-                for key, label in zip(FLAGS, LABELS, strict=True)
-            )
-        ]
+        sharing = " · ".join(
+            f"{label}: {MODES[getattr(self.sharing, key)]}"
+            for key, label in zip(FLAGS, LABELS, strict=True)
+        )
         if not self.parsed:
             return "\n".join(
                 lines
                 + [
+                    sharing,
                     "CSV · UTF-8 · 500 rows · 256 KiB",
                     "Required: `user_id`, `month`, `day`",
                     "Optional: `timezone` (IANA), `opt_out`, `list_public`, `announce`, `dm_enabled`, `mention_enabled`",
@@ -208,34 +264,45 @@ class ImportView(OwnedView):
                     "Missing timezone → pending. Header-only CSV clears the list.",
                 ]
             )
+        reason = self.blocking_reason()
+        if reason and self.phase != "verifying":
+            lines.append(f"❌ {reason}")
+        errors, remaining = [], []
+        for item in self.preview_items()[self.page * 10 : (self.page + 1) * 10]:
+            if isinstance(item, ImportIssue):
+                errors.append(f"❌ Line {item.line}: {item.message}")
+            elif self.row_error(item):
+                errors.append(self.row_content(item))
+            else:
+                remaining.append(self.row_content(item))
+        lines.extend(errors)
+        lines.append(sharing)
+        if reason and self.phase == "verifying":
+            lines.append(reason)
+        if self.issues_only:
+            lines.append("Showing blocking rows only.")
         counts = {
             state: list(self.statuses.values()).count(state)
             for state in {"member", "left", "unverified"}
         }
         lines += [
-            f"{self.parsed.total} rows · {len(self.parsed.issues)} errors · {self.phase}",
+            f"{self.parsed.total} rows · {len(self.parsed.issues) + sum(self.row_error(row) for row in self.parsed.rows)} errors · {self.phase}",
             f"Verified members: {counts['member']} · not in server: {counts['left']} · unverified: {counts['unverified']}",
             f"Checked: {len(self.statuses)}/{len(self.parsed.rows)} · ignored columns: {self.parsed.ignored_columns}",
         ]
-        if self.parsed.issues:
-            lines += ["Fix errors before importing."]
-            values = self.parsed.issues
-            lines += [
-                f"Line {issue.line}: {issue.message}"
-                for issue in values[self.page * 10 : (self.page + 1) * 10]
-            ]
-        else:
-            lines += [
-                self.row_content(row)
-                for row in self.parsed.rows[self.page * 10 : (self.page + 1) * 10]
-            ]
+        lines.extend(remaining)
         return "\n".join(lines)
 
     def row_content(self, row):
         state = self.statuses.get(row.user_id, "waiting")
+        if self.row_error(row):
+            reason = (
+                "Not in this server. Check the ID or remove this row."
+                if state == "left"
+                else "Verification failed. Retry verification."
+            )
+            return f"❌ Line {row.line}: <@{row.user_id}> · {reason}"
         line = f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'Timezone required'} · {state}\n"
-        if state == "left":
-            return line + "Not in this server. Remove this row before replacing the list."
         return line + " · ".join(
             f"{label}: {'On' if enabled else 'Off'}"
             for label, enabled in zip(
@@ -245,15 +312,18 @@ class ImportView(OwnedView):
             )
         )
 
-    async def refresh(self, interaction):
-        self.reviewed = False
-        self.build()
-        await edit(
-            interaction,
-            content=self.content(),
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+    async def refresh(self, interaction, *, background=False):
+        async with self.edit_lock:
+            if self.is_finished() or (background and self.reviewed):
+                return
+            self.reviewed = False
+            self.build()
+            await edit(
+                interaction,
+                content=self.content(),
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     async def upload(self, interaction):
         await interaction.response.send_modal(ImportUpload(self))
@@ -273,8 +343,13 @@ class ImportView(OwnedView):
         if self.parsed:
             self.page = min(
                 self.page + 1,
-                max(0, (max(len(self.parsed.rows), len(self.parsed.issues)) - 1) // 10),
+                max(0, (len(self.preview_items()) - 1) // 10),
             )
+        await self.refresh(interaction)
+
+    async def toggle_issues(self, interaction):
+        self.issues_only = not self.issues_only
+        self.page = 0
         await self.refresh(interaction)
 
     async def open_sharing(self, interaction):
@@ -304,9 +379,9 @@ class ImportView(OwnedView):
         await self.refresh(interaction)
 
     async def retry(self, interaction):
-        if self.parsed and self.phase == "ready" and "unverified" in self.statuses.values():
+        if self.can_retry():
             self.statuses = {
-                user: state for user, state in self.statuses.items() if state != "unverified"
+                user: state for user, state in self.statuses.items() if state == "member"
             }
             self.launch(interaction)
         await self.refresh(interaction)
@@ -334,16 +409,16 @@ class ImportView(OwnedView):
                         for remaining in parsed.rows:
                             self.statuses.setdefault(remaining.user_id, "unverified")
                         break
-            self.phase = "ready"
+            verified = sum(state == "member" for state in self.statuses.values())
+            self.phase = "ready" if verified == len(parsed.rows) else "blocked"
             log.info(
-                "csv_verified guild=%s actor=%s rows=%s verified=%s",
+                "csv_verified guild=%s actor=%s rows=%s verified=%s phase=%s",
                 self.guild_id,
                 self.owner,
                 parsed.total,
-                len(self.statuses),
+                verified,
+                self.phase,
             )
-            if not self.is_finished():
-                await self.refresh(interaction)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -354,19 +429,34 @@ class ImportView(OwnedView):
                 self.owner,
                 type(exc).__name__,
             )
-            if not self.is_finished():
-                try:
-                    await self.refresh(interaction)
-                except discord.HTTPException:
-                    pass
+        if not self.is_finished():
+            try:
+                await self.refresh(interaction, background=True)
+            except Exception as exc:
+                log.warning(
+                    "csv_preview_update_failed guild=%s actor=%s type=%s",
+                    self.guild_id,
+                    self.owner,
+                    type(exc).__name__,
+                )
 
     async def review(self, interaction):
-        if not self.ready() or self.sharing_draft is not None:
+        if self.parsed is None or self.sharing_draft is not None:
             await private(
                 interaction,
-                "Fix CSV errors and verify every listed member before replacing the list.",
+                "Upload a CSV and close the Sharing menu first.",
             )
             return
+        if not self.ready():
+            self.issues_only, self.page = False, 0
+            await self.refresh(interaction)
+            return
+        async with self.edit_lock:
+            if not self.is_finished():
+                await self._show_review(interaction)
+
+    async def _show_review(self, interaction):
+        self.issues_only = False
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         plan = await self.bot.db.import_plan(self.guild_id, [row.user_id for row in rows])
         self.reviewed = True

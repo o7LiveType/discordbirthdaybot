@@ -1003,11 +1003,11 @@ async def test_import_verifies_existing_members_and_blocks_departed_rows(menu):
     ).encode()
     await upload_csv(bot, value, view, data)
     assert view.statuses == {first: "member", second: "left", third: "member"}
-    assert "Remove this row before replacing the list" in response_text(value)
+    assert "Check the ID or remove this row" in response_text(value)
     assert value.guild.fetch_member.await_count == 3
     assert not view.ready()
     await view.review(value)
-    assert "verify every listed member" in value.followup.send.call_args.args[0]
+    assert "Review blocked" in response_text(value)
     assert (await bot.db.birthday(1, first))["month"] == 8
     # Correct the file; a missing timezone replaces an active date with pending data.
     await upload_csv(bot, value, view, f"user_id,month,day\n{first},1,1\n{third},1,1\n".encode())
@@ -1042,6 +1042,166 @@ async def test_import_failed_member_checks_block_commit_and_support_retry(menu):
     assert view.ready()
 
 
+async def test_review_stays_clickable_and_finds_blocking_rows_after_verification(menu):
+    bot, value, view = await importer(menu)
+    first = 111111111111111111
+    missing = first + 11
+    present = False
+
+    async def lookup(user_id):
+        if user_id == missing and not present:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "missing")
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member.side_effect = lookup
+    data = (
+        "user_id,month,day,timezone\n"
+        + "".join(f"{first + index},1,1,UTC\n" for index in range(12))
+    ).encode()
+    await upload_csv(bot, value, view, data)
+    review = next(item for item in view.children if getattr(item, "label", None) == "Review import")
+    assert not review.disabled
+    await click(bot, value, "Next")
+    assert view.page == 1
+    await click(bot, value, "Review import")
+    assert view.phase == "blocked" and not view.ready()
+    assert view.page == 0 and not view.issues_only
+    assert "Review blocked" in response_text(value)
+    assert response_text(value).index(str(missing)) < response_text(value).index(str(first))
+    assert response_text(value).count("<@") == 10
+    assert view.content().splitlines()[1].startswith("❌")
+    assert f"❌ Line 13: <@{missing}>" in view.content()
+    assert not any(
+        getattr(item, "label", None) == "Replace birthday list" for item in view.children
+    )
+    await view.confirm(value)
+    assert not await bot.db.read("SELECT * FROM birthdays")
+    await click(bot, value, "Show issues")
+    assert view.issues_only and response_text(value).count("<@") == 1
+    await click(bot, value, "Show all rows")
+    assert not view.issues_only and response_text(value).count("<@") == 10
+    present = True
+    retry = next(
+        item for item in view.children if getattr(item, "label", None) == "Retry verification"
+    )
+    assert not retry.disabled
+    await click(bot, value, "Retry verification")
+    await view.job
+    assert view.ready() and value.guild.fetch_member.await_count == 13
+    await click(bot, value, "Review import")
+    assert view.reviewed
+
+
+async def test_review_shows_progress_and_does_not_allow_replacement_during_verification(menu):
+    bot, value, view = await importer(menu)
+    release = asyncio.Event()
+
+    async def lookup(user_id):
+        await release.wait()
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member.side_effect = lookup
+    try:
+        await upload_csv(
+            bot, value, view, b"user_id,month,day\n111111111111111111,1,1\n", wait=False
+        )
+        assert view.phase == "verifying"
+        review = next(
+            item for item in view.children if getattr(item, "label", None) == "Review import"
+        )
+        assert not review.disabled
+        await click(bot, value, "Review import")
+        assert "Verification in progress" in response_text(value)
+        assert not view.reviewed
+        await view.confirm(value)
+        assert not await bot.db.read("SELECT * FROM birthdays")
+    finally:
+        release.set()
+        await view.job
+    assert view.ready()
+
+
+async def test_verification_completion_waits_for_older_preview_edits_and_preserves_review(menu):
+    bot, value, view = await importer(menu)
+    editing, fetched, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    started, completed = [], []
+
+    async def delayed_edit(**payload):
+        state = "verifying" if "· verifying" in payload["embed"].description else "ready"
+        started.append(state)
+        if len(started) == 1:
+            editing.set()
+            await release.wait()
+        completed.append(state)
+
+    async def lookup(user_id):
+        fetched.set()
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.edit_original_response.side_effect = delayed_edit
+    value.guild.fetch_member.side_effect = lookup
+    upload = asyncio.create_task(
+        upload_csv(bot, value, view, b"user_id,month,day\n111111111111111111,1,1\n", wait=False)
+    )
+    try:
+        async with asyncio.timeout(2):
+            await editing.wait()
+            await fetched.wait()
+        assert view.ready()
+        assert started == ["verifying"]
+    finally:
+        release.set()
+        await upload
+        await view.job
+    assert completed == ["verifying", "ready"]
+    value.edit_original_response.side_effect = None
+    await click(bot, value, "Review import")
+    calls = value.edit_original_response.await_count
+    await view.refresh(value, background=True)
+    assert view.reviewed and value.edit_original_response.await_count == calls
+    assert any(getattr(item, "label", None) == "Replace birthday list" for item in view.children)
+
+
+async def test_preview_send_failure_keeps_verified_state_and_review_can_recover(menu, caplog):
+    bot, value, view = await importer(menu)
+
+    async def fail_completed_preview(**payload):
+        if "· ready" in payload["embed"].description:
+            raise OSError("temporary transport failure")
+
+    value.edit_original_response.side_effect = fail_completed_preview
+    with caplog.at_level(logging.WARNING):
+        await upload_csv(bot, value, view, b"user_id,month,day\n111111111111111111,1,1\n")
+    assert view.ready()
+    assert "csv_preview_update_failed" in caplog.text
+    assert "csv_verification_failed" not in caplog.text
+    value.edit_original_response.side_effect = None
+    await click(bot, value, "Review import")
+    assert view.reviewed
+
+
+async def test_failed_verification_has_a_working_retry_and_csv_errors_are_reviewable(menu):
+    bot, value, view = await importer(menu)
+    value.guild.fetch_member.side_effect = RuntimeError("unexpected verification failure")
+    await upload_csv(bot, value, view, b"user_id,month,day\n111111111111111111,1,1\n")
+    assert view.phase == "failed" and view.can_retry()
+    await click(bot, value, "Review import")
+    assert "Verification failed. Use Retry verification" in response_text(value)
+
+    async def lookup(user_id):
+        return SimpleNamespace(id=user_id, guild=SimpleNamespace(id=1))
+
+    value.guild.fetch_member.side_effect = lookup
+    await click(bot, value, "Retry verification")
+    await view.job
+    assert view.ready()
+    await upload_csv(bot, value, view, b"user_id,month,day\n111111111111111111,4,31\n")
+    await click(bot, value, "Review import")
+    assert "fix the CSV errors" in response_text(value)
+    assert "Line 2" in response_text(value)
+    assert not view.reviewed
+
+
 async def test_import_csv_errors_never_start_member_checks_and_upload_can_retry(menu):
     bot, value, view = await importer(menu)
     first = 111111111111111111
@@ -1051,6 +1211,32 @@ async def test_import_csv_errors_never_start_member_checks_and_upload_can_retry(
     await upload_csv(bot, value, view, f"user_id,month,day\n{first},4,30\n".encode())
     assert view.ready()
     assert await bot.db.pending_birthday(1, first) is None
+
+
+async def test_csv_errors_are_red_and_before_valid_rows_and_other_preview_information(menu):
+    bot, value, view = await importer(menu)
+    data = (
+        b"user_id,month,day,timezone\n"
+        b"111111111111111111,1,1,UTC\n"
+        b"222222222222222222,4,31,UTC\n"
+        b"333333333333333333,3,3,UTC\n"
+    )
+    await upload_csv(bot, value, view, data)
+    await click(bot, value, "Review import")
+    text = view.content()
+    assert text.splitlines()[1].startswith("❌")
+    assert (
+        text.index("❌ Line 3:")
+        < text.index("Public list:")
+        < text.index("Line 2:")
+        < text.index("Line 4:")
+    )
+    assert not view.reviewed
+    value.guild.fetch_member.assert_not_awaited()
+    await click(bot, value, "Show issues")
+    assert "❌ Line 3:" in view.content() and "Line 2:" not in view.content()
+    await click(bot, value, "Show all rows")
+    assert "Line 2:" in view.content()
 
 
 async def test_import_permission_revocation_blocks_upload_and_final_confirmation(menu):
