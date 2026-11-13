@@ -331,9 +331,13 @@ class Database:
         query, params = self.import_query(guild_id, user_ids)
         return {row[0] for row in await self.read(query, params)}
 
-    async def import_birthdays(self, guild_id, actor, rows, *, csv_sharing=False):
-        from .csv_import import MAX_ROWS, validate_row
+    async def import_birthdays(self, guild_id, actor, rows, *, csv_sharing=False, sharing=None):
+        from .csv_import import MAX_ROWS, ImportSharing, validate_row
 
+        if sharing is None:
+            sharing = ImportSharing.all("csv" if csv_sharing else "off")
+        if not isinstance(sharing, ImportSharing):
+            raise ValueError("Invalid import sharing settings.")
         if not rows or len(rows) > MAX_ROWS or len({row.user_id for row in rows}) != len(rows):
             raise ValueError("Invalid import batch size or duplicate members.")
         for row in rows:
@@ -352,7 +356,8 @@ class Database:
             for row in rows:
                 if row.user_id in existing:
                     continue
-                consent = bool(csv_sharing and row.consent is True)
+                permissions = sharing.resolve(row)
+                consent = permissions.enabled
                 if row.timezone:
                     complete.append(
                         (
@@ -366,7 +371,7 @@ class Database:
                             settings["leap"],
                             consent,
                             now,
-                            *Sharing.all(consent).values(),
+                            *permissions.values(),
                         )
                     )
                 else:
@@ -380,7 +385,7 @@ class Database:
                             consent,
                             now,
                             actor,
-                            *Sharing.all(consent).values(),
+                            *permissions.values(),
                         )
                     )
             await conn.executemany(

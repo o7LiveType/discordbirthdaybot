@@ -646,6 +646,9 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     from birthdaybot.csv_import import parse_csv
 
     bot, value, view = await importer(menu)
+    await click(bot, value, "Sharing")
+    await click(bot, value, "All off")
+    await click(bot, value, "Apply")
     first, second = 111111111111111111, 222222222222222222
     data = f"user_id,month,day,timezone,opt_out\n{first},2,29,UTC,false\n{second},3,4,,false\n".encode()
     modal = await upload_csv(bot, value, view, data)
@@ -656,7 +659,8 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     await view.confirm(value)  # Explicit review is required first.
     assert await bot.db.birthday(1, first) is None
     await click(bot, value, "Review import")
-    assert "Public list + posts + DMs: 0 members" in response_text(value)
+    assert "Public list: 0 · pending: 0" in response_text(value)
+    assert "Server posts: 0 · pending: 0" in response_text(value)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 0
     assert await bot.db.birthday(1, second) is None
@@ -685,15 +689,136 @@ async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(m
     first, second = 111111111111111111, 222222222222222222
     data = f"user_id,month,day,timezone,consent\n{first},1,1,UTC,true\n{second},2,2,UTC,true\n".encode()
     await upload_csv(bot, value, view, data)
-    await click(bot, value, "CSV sharing: OFF")
     await click(bot, value, "Review import")
-    assert "Public list + posts + DMs: 2 members" in response_text(value)
+    for label in ("Public list", "Server posts", "Birthday DMs", "Post mentions"):
+        assert f"{label}: 2 · pending: 0" in response_text(value)
     await bot.db.save(1, second, 9, 9, "Asia/Tokyo", 0, 0, "feb28", False)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 1
     assert (await bot.db.birthday(1, second))["month"] == 9
     assert (await bot.db.birthday(1, second))["consent"] == 0
     assert "Additional skips: 1" in response_text(value)
+
+
+async def test_import_granular_sharing_drafts_preview_and_committed_permissions_match(menu):
+    from birthdaybot.csv_import import ImportSharing
+    from birthdaybot.sharing import Sharing
+
+    bot, value, view = await importer(menu)
+    first, second, third = 111111111111111111, 222222222222222222, 333333333333333333
+    data = (
+        "user_id,month,day,timezone,opt_out,list_public,announce,dm_enabled,mention_enabled\n"
+        f"{first},1,1,UTC,false,true,true,true,true\n"
+        f"{second},2,2,,,true,,true,false\n"
+        f"{third},3,3,UTC,true,true,true,true,true\n"
+    ).encode()
+    await upload_csv(bot, value, view, data)
+    assert "Public: On · Posts: On · DMs: On · Mentions: On" in response_text(value)
+    await click(bot, value, "Sharing")
+    assert len(view.to_components()) == 5
+    assert all(
+        len(item.options) == 3 for item in view.children if isinstance(item, discord.ui.Select)
+    )
+    await choose(view, value, 0, "off")
+    assert view.sharing == ImportSharing()  # Draft remains uncommitted.
+    await click(bot, value, "Back")
+    assert view.sharing == ImportSharing()
+    await click(bot, value, "Sharing")
+    await choose(view, value, 0, "on")
+    await choose(view, value, 2, "off")
+    stale_select = next(item for item in view.children if isinstance(item, discord.ui.Select))
+    await click(bot, value, "Apply")
+    assert view.sharing == ImportSharing("on", "csv", "off", "csv")
+    assert not await bot.db.read("SELECT * FROM birthdays")
+    stale_select._values = ["off"]
+    await stale_select.callback(value)
+    assert "Sharing menu closed" in value.followup.send.call_args.args[0]
+    assert view.sharing == ImportSharing("on", "csv", "off", "csv")
+    await bot.db.configure(1, 100, None, "UTC", 0, 0, "", ping_everyone=True)
+    await click(bot, value, "Review import")
+    assert "Public list: 1 · pending: 1" in response_text(value)
+    assert "Server posts: 1 · pending: 0" in response_text(value)
+    assert "Birthday DMs: 0 · pending: 0" in response_text(value)
+    assert "Post mentions: 1 · pending: 0" in response_text(value)
+    assert "Everyone ping: On" in response_text(value)
+    assert "Existing records and sharing are unchanged" in response_text(value)
+    await click(bot, value, "Confirm import")
+    assert Sharing.from_record(await bot.db.birthday(1, first)) == Sharing(True, True, False, True)
+    assert Sharing.from_record(await bot.db.pending_birthday(1, second)) == Sharing(
+        True, False, False, False
+    )
+    assert Sharing.from_record(await bot.db.birthday(1, third)) == Sharing.all(False)
+    assert (await bot.db.directory(1))["visible"] == 1
+    assert value.edit_original_response.call_args.kwargs["allowed_mentions"].to_dict() == {
+        "parse": []
+    }
+
+
+async def test_import_sharing_changes_require_new_review_and_revoked_access_is_blocked(menu):
+    from birthdaybot.csv_import import ImportSharing
+
+    bot, value, view = await importer(menu)
+    await upload_csv(
+        bot, value, view, b"user_id,month,day,timezone,opt_out\n111111111111111111,1,1,UTC,false\n"
+    )
+    await click(bot, value, "Review import")
+    assert view.reviewed
+    await view.open_sharing(value)
+    assert not view.reviewed
+    value.user.guild_permissions = discord.Permissions.none()
+    await choose(view, value, 0, "off")
+    assert "Manage Server" in value.followup.send.call_args.args[0]
+    assert view.sharing_draft == ImportSharing()
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    value.user.id = 21
+    await choose(view, value, 0, "off")
+    assert view.sharing_draft == ImportSharing()
+    value.user.id = 20
+    value.guild_id = 2
+    await choose(view, value, 0, "off")
+    assert view.sharing_draft == ImportSharing()
+    value.guild_id = 1
+    await click(bot, value, "All off")
+    await click(bot, value, "Apply")
+    await view.confirm(value)  # Old confirmation cannot apply changed permissions.
+    assert not await bot.db.read("SELECT * FROM birthdays")
+    await click(bot, value, "Review import")
+    assert "Server posts: 0 · pending: 0" in response_text(value)
+    await click(bot, value, "Confirm import")
+    assert not (await bot.db.birthday(1, 111111111111111111))["announce"]
+
+
+async def test_import_template_contains_all_supported_sharing_flags(menu):
+    from birthdaybot.import_ui import TEMPLATE
+    from birthdaybot.sharing import FLAGS
+
+    bot, value, view = await importer(menu)
+    await click(bot, value, "CSV template")
+    args = value.followup.send.call_args.kwargs
+    assert args["ephemeral"] and args["allowed_mentions"].to_dict() == {"parse": []}
+    assert args["file"].fp.read() == TEMPLATE
+    assert all(key.encode() in TEMPLATE for key in FLAGS)
+
+
+async def test_large_granular_import_preview_stays_within_discord_embed_limits(menu):
+    bot, value, view = await importer(menu)
+    data = (
+        "user_id,month,day,timezone,list_public,announce,dm_enabled,mention_enabled\n"
+        + "".join(
+            f"{111111111111111111 + index},2,29,America/Argentina/ComodRivadavia,true,true,false,true\n"
+            for index in range(500)
+        )
+    ).encode()
+    await upload_csv(bot, value, view, data)
+    assert view.ready()
+    assert len(view.content()) < 4096
+    assert view.content().count("<@") == 10
+    await click(bot, value, "Next")
+    assert view.page == 1 and len(view.content()) < 4096
+    await click(bot, value, "Review import")
+    assert "Server posts: 500 · pending: 0" in response_text(value)
+    assert "Birthday DMs: 0 · pending: 0" in response_text(value)
+    assert not await bot.db.read("SELECT * FROM birthdays")
 
 
 async def test_import_verifies_members_and_skips_existing_and_departed_users(menu):
@@ -714,6 +839,7 @@ async def test_import_verifies_members_and_skips_existing_and_departed_users(men
     ).encode()
     await upload_csv(bot, value, view, data)
     assert view.statuses == {first: "existing", second: "left", third: "member"}
+    assert "Skipped: existing birthday and sharing unchanged." in response_text(value)
     assert value.guild.fetch_member.await_count == 2
     await click(bot, value, "Review import")
     await click(bot, value, "Confirm import")

@@ -3,14 +3,17 @@
 import asyncio
 import io
 import logging
+from dataclasses import replace
 
 import discord
 
-from .csv_import import MAX_BYTES, parse_csv
+from .csv_import import MAX_BYTES, ImportSharing, parse_csv
+from .sharing import FLAGS, LABELS
 from .ui import OwnedView, button, edit, navigation, private
 
 log = logging.getLogger(__name__)
-TEMPLATE = b"user_id,month,day,timezone,opt_out\n"
+TEMPLATE = b"user_id,month,day,timezone,opt_out,list_public,announce,dm_enabled,mention_enabled\n"
+MODES = {"off": "Off", "on": "On", "csv": "From CSV"}
 
 
 class ImportUpload(discord.ui.Modal):
@@ -65,7 +68,9 @@ class ImportView(OwnedView):
         self.parsed, self.job = None, None
         self.statuses = {}
         self.phase = "empty"
-        self.csv_sharing, self.page, self.completed = False, 0, False
+        self.sharing = ImportSharing()
+        self.sharing_draft = None
+        self.page, self.completed = 0, False
         self.reviewed = False
         bot.import_sessions[guild_id] = self
         self.build()
@@ -74,6 +79,7 @@ class ImportView(OwnedView):
         if self.job and not self.job.done():
             self.job.cancel()
         self.parsed = None
+        self.sharing_draft = None
         self.statuses.clear()
         if self.bot.import_sessions.get(self.guild_id) is self:
             del self.bot.import_sessions[self.guild_id]
@@ -87,7 +93,8 @@ class ImportView(OwnedView):
             self.job.cancel()
         self.job = None
         self.parsed, self.statuses, self.page = parsed, {}, 0
-        self.csv_sharing = False
+        self.sharing_draft = None
+        self.reviewed = False
         self.phase = "invalid" if parsed.issues else "verifying"
         if not parsed.issues:
             self.launch(interaction)
@@ -114,6 +121,35 @@ class ImportView(OwnedView):
 
     def build(self):
         self.clear_items()
+        if self.sharing_draft is not None:
+            for row, (key, label) in enumerate(zip(FLAGS, LABELS, strict=True)):
+                selected = getattr(self.sharing_draft, key)
+                select = discord.ui.Select(
+                    placeholder=f"{label}: {MODES[selected]}",
+                    row=row,
+                    options=[
+                        discord.SelectOption(
+                            label=f"{label}: {label_mode}", value=mode, default=mode == selected
+                        )
+                        for mode, label_mode in MODES.items()
+                    ],
+                )
+
+                async def choose(interaction, key=key, select=select):
+                    if self.sharing_draft is None:
+                        await private(interaction, "Sharing menu closed.")
+                        return
+                    self.sharing_draft = replace(self.sharing_draft, **{key: select.values[0]})
+                    await self.refresh(interaction)
+
+                select.callback = choose
+                self.add_item(select)
+            self.add_item(
+                button("Apply", self.apply_sharing, row=4, style=discord.ButtonStyle.success)
+            )
+            self.add_item(button("Back", self.cancel_sharing, row=4))
+            self.add_item(button("All off", self.private_sharing, row=4))
+            return
         self.add_item(button("Upload CSV", self.upload, row=0, opens_modal=True))
         self.add_item(button("CSV template", self.template, row=0))
         self.add_item(button("Refresh preview", self.refresh, row=0))
@@ -129,8 +165,8 @@ class ImportView(OwnedView):
         )
         self.add_item(
             button(
-                "CSV sharing: " + ("ON" if self.csv_sharing else "OFF"),
-                self.toggle,
+                "Sharing",
+                self.open_sharing,
                 row=2,
                 disabled=self.phase == "verifying",
             )
@@ -155,14 +191,23 @@ class ImportView(OwnedView):
         self.add_item(button("Cancel / Server tools", self.bot.menu_actions["tools"], row=3))
 
     def content(self):
+        if self.sharing_draft is not None:
+            return "**Import sharing**\nOff: disabled. On: enabled unless CSV opts out.\nFrom CSV: use flags; blank stays off.\n`opt_out=true` disables all four."
         lines = ["**Import birthdays**"]
+        lines += [
+            " · ".join(
+                f"{label}: {MODES[getattr(self.sharing, key)]}"
+                for key, label in zip(FLAGS, LABELS, strict=True)
+            )
+        ]
         if not self.parsed:
             return "\n".join(
                 lines
                 + [
                     "CSV · UTF-8 · 500 rows · 256 KiB",
                     "Required: `user_id`, `month`, `day`",
-                    "Optional: `timezone` (IANA), `opt_out` (true/false)",
+                    "Optional: `timezone` (IANA), `opt_out`, `list_public`, `announce`, `dm_enabled`, `mention_enabled`",
+                    "Sharing flags: true/false. `opt_out=true` disables all four.",
                     "Existing records skipped. Missing timezone → pending.",
                 ]
             )
@@ -184,10 +229,26 @@ class ImportView(OwnedView):
             ]
         else:
             lines += [
-                f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'Timezone required'} · {self.statuses.get(row.user_id, 'waiting')}"
+                self.row_content(row)
                 for row in self.parsed.rows[self.page * 10 : (self.page + 1) * 10]
             ]
         return "\n".join(lines)
+
+    def row_content(self, row):
+        state = self.statuses.get(row.user_id, "waiting")
+        line = f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'Timezone required'} · {state}\n"
+        if state == "existing":
+            return line + "Skipped: existing birthday and sharing unchanged."
+        if state == "left":
+            return line + "Skipped: not in this server."
+        return line + " · ".join(
+            f"{label}: {'On' if enabled else 'Off'}"
+            for label, enabled in zip(
+                ("Public", "Posts", "DMs", "Mentions"),
+                self.sharing.resolve(row).values(),
+                strict=True,
+            )
+        )
 
     async def refresh(self, interaction):
         self.reviewed = False
@@ -205,7 +266,7 @@ class ImportView(OwnedView):
     async def template(self, interaction):
         await private(
             interaction,
-            "UTF-8 CSV. Blank sharing stays off.",
+            "UTF-8 CSV. Sharing flags: true/false; blank stays off. opt_out=true disables all sharing.",
             file=discord.File(io.BytesIO(TEMPLATE), filename="birthday-import-template.csv"),
         )
 
@@ -221,8 +282,30 @@ class ImportView(OwnedView):
             )
         await self.refresh(interaction)
 
-    async def toggle(self, interaction):
-        self.csv_sharing = not self.csv_sharing
+    async def open_sharing(self, interaction):
+        if self.phase == "verifying":
+            await private(interaction, "Wait for verification to finish.")
+            return
+        self.sharing_draft = self.sharing
+        await self.refresh(interaction)
+
+    async def apply_sharing(self, interaction):
+        if self.sharing_draft is None:
+            await private(interaction, "Sharing menu closed.")
+            return
+        self.sharing = self.sharing_draft
+        self.sharing_draft = None
+        await self.refresh(interaction)
+
+    async def cancel_sharing(self, interaction):
+        self.sharing_draft = None
+        await self.refresh(interaction)
+
+    async def private_sharing(self, interaction):
+        if self.sharing_draft is None:
+            await private(interaction, "Sharing menu closed.")
+            return
+        self.sharing_draft = ImportSharing.all("off")
         await self.refresh(interaction)
 
     async def retry(self, interaction):
@@ -291,44 +374,64 @@ class ImportView(OwnedView):
                     pass
 
     async def review(self, interaction):
-        if not self.ready():
+        if not self.ready() or self.sharing_draft is not None:
             await private(interaction, "Verification incomplete or CSV errors remain.")
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         self.reviewed = True
         pending = sum(row.timezone is None for row in rows)
-        enabled = sum(
-            bool(self.csv_sharing and row.timezone and row.consent is True) for row in rows
-        )
+        resolved = [(row.timezone is not None, self.sharing.resolve(row)) for row in rows]
+        counts = []
+        for key, label in zip(FLAGS, LABELS, strict=True):
+            active = sum(
+                complete and getattr(permissions, key) for complete, permissions in resolved
+            )
+            deferred = sum(
+                not complete and getattr(permissions, key) for complete, permissions in resolved
+            )
+            counts.append(f"{label}: {active} · pending: {deferred}")
+        settings = await self.bot.db.guild(self.guild_id)
+        counts.append(f"Everyone ping: {'On' if settings['ping_everyone'] else 'Off'}")
+        if not settings["enabled"]:
+            counts.append("Posts and DMs: Paused")
+        if not settings["public_birthdays"]:
+            counts.append("Public lists: Moderators only")
         self.clear_items()
         self.add_item(button("Confirm import", self.confirm, style=discord.ButtonStyle.danger))
         self.add_item(button("Back to preview", self.refresh))
         await edit(
             interaction,
-            content=f"**Confirm import**\nSave: {len(rows) - pending} · Pending timezone: {pending}\nPublic list + posts + DMs: {enabled} members\nExisting and departed members skipped.",
+            content=f"**Confirm import**\nSave: {len(rows) - pending} · Pending timezone: {pending}\n"
+            + "\n".join(counts)
+            + "\nExisting records and sharing are unchanged. Departed members skipped.",
             view=self,
         )
 
     async def confirm(self, interaction):
         if not await self.check_access(interaction):
             return
-        if self.completed or not self.ready() or not self.reviewed:
+        if (
+            self.completed
+            or not self.ready()
+            or not self.reviewed
+            or self.sharing_draft is not None
+        ):
             await private(interaction, "Import completed or not ready.")
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         async with self.bot.mutation_lock:
             saved, pending, skipped = await self.bot.db.import_birthdays(
-                self.guild_id, self.owner, rows, csv_sharing=self.csv_sharing
+                self.guild_id, self.owner, rows, sharing=self.sharing
             )
         self.completed = True
         log.info(
-            "csv_imported guild=%s actor=%s saved=%s pending=%s raced_skips=%s csv_sharing=%s",
+            "csv_imported guild=%s actor=%s saved=%s pending=%s raced_skips=%s sharing=%s",
             self.guild_id,
             self.owner,
             saved,
             pending,
             skipped,
-            self.csv_sharing,
+            {key: getattr(self.sharing, key) for key in FLAGS},
         )
         await edit(
             interaction,

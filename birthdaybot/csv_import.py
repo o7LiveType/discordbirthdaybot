@@ -6,6 +6,7 @@ import io
 import re
 from dataclasses import dataclass
 
+from .sharing import FLAGS, Sharing
 from .timeutil import anniversary, timezone
 
 MAX_BYTES = 256 * 1024
@@ -26,6 +27,11 @@ HEADERS = {
     "consent": "consent",
     "sharing": "consent",
     "show_birthday": "consent",
+    **{key: key for key in FLAGS},
+    "public_list": "list_public",
+    "server_posts": "announce",
+    "birthday_dms": "dm_enabled",
+    "post_mentions": "mention_enabled",
 }
 MONTHS = {
     name.casefold(): number
@@ -43,6 +49,44 @@ class ImportRow:
     day: int
     timezone: str | None
     consent: bool | None
+    list_public: bool | None = None
+    announce: bool | None = None
+    dm_enabled: bool | None = None
+    mention_enabled: bool | None = None
+
+
+@dataclass(frozen=True)
+class ImportSharing:
+    """Per-flag import defaults; explicit CSV refusals always take precedence."""
+
+    list_public: str = "csv"
+    announce: str = "csv"
+    dm_enabled: str = "csv"
+    mention_enabled: str = "csv"
+
+    def __post_init__(self):
+        if any(
+            type(getattr(self, key)) is not str or getattr(self, key) not in {"off", "on", "csv"}
+            for key in FLAGS
+        ):
+            raise ValueError("Import sharing must be Off, On or From CSV.")
+
+    @classmethod
+    def all(cls, mode):
+        return cls(*(mode for _ in FLAGS))
+
+    def resolve(self, row):
+        if row.consent is False:
+            return Sharing.all(False)
+        values = []
+        for key in FLAGS:
+            mode, explicit = getattr(self, key), getattr(row, key)
+            values.append(
+                mode != "off"
+                and explicit is not False
+                and (mode == "on" or explicit is True or row.consent is True)
+            )
+        return Sharing(*values)
 
 
 @dataclass(frozen=True)
@@ -78,7 +122,7 @@ def boolean(value):
         return True
     if value.casefold() in {"false", "no", "0", "off"}:
         return False
-    raise ValueError("Sharing/opt_out must be true/false, yes/no, on/off or 1/0.")
+    raise ValueError("Sharing flags must be true/false, yes/no, on/off or 1/0.")
 
 
 def validate_row(row):
@@ -87,7 +131,10 @@ def validate_row(row):
     anniversary(row.month, row.day, 2000, "feb28")
     if row.timezone is not None and timezone(row.timezone) != row.timezone:
         raise ValueError("Timezone must use its canonical IANA name.")
-    if row.consent is not None and type(row.consent) is not bool:
+    if any(
+        value is not None and type(value) is not bool
+        for value in (row.consent, *(getattr(row, key) for key in FLAGS))
+    ):
         raise ValueError("Invalid sharing choice.")
 
 
@@ -109,11 +156,11 @@ def parse_csv(data):
         named = [key for key in keys if key]
         if len(named) != len(set(named)) or ("opt_out" in named and "consent" in named):
             raise ValueError(
-                "Duplicate or conflicting CSV headers. Supply each field once and only one sharing column."
+                "Duplicate or conflicting CSV headers. Supply each field once; use opt_out or consent, not both."
             )
         if not {"user_id", "month", "day"} <= set(named):
             raise ValueError(
-                "CSV headers must include user_id (or member_id), month and day. Optional: timezone and opt_out."
+                "CSV headers must include user_id (or member_id), month and day. Optional: timezone, opt_out, list_public, announce, dm_enabled, mention_enabled."
             )
         rows, issues, seen, total = [], [], {}, 0
         for fields in reader:
@@ -152,7 +199,21 @@ def parse_csv(data):
                 sharing = boolean(values.get("opt_out", values.get("consent", "")))
                 if "opt_out" in values and sharing is not None:
                     sharing = not sharing
-                row = ImportRow(line, user, month, day, zone, sharing)
+                permissions = {}
+                for key in FLAGS:
+                    try:
+                        permissions[key] = boolean(values.get(key, ""))
+                    except ValueError as exc:
+                        raise ValueError(f"{key}: {exc}") from exc
+                row = ImportRow(
+                    line,
+                    user,
+                    month,
+                    day,
+                    zone,
+                    sharing,
+                    **permissions,
+                )
                 validate_row(row)
                 rows.append(row)
             except ValueError as exc:
