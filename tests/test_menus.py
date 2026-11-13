@@ -1,6 +1,9 @@
 """Exercise menu paths without a Discord token or network calls."""
 
 import asyncio
+import json
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -192,6 +195,116 @@ async def test_revoked_mod_access_blocks_queued_mutations_and_modal_submissions(
     modal = FieldsModal("GIF", [("gif", "GIF URL", "")], submit, 20, admin=True, queue=bot.queue)
     await modal.on_submit(value)
     submit.assert_not_awaited()
+
+
+async def test_server_config_export_is_private_complete_and_server_scoped(menu, caplog):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    bot.config = replace(bot.config, token="test-export-secret")
+    channel, alerts = 9007199254740993, 9007199254740995
+    await bot.db.configure(
+        1,
+        channel,
+        alerts,
+        "UTC",
+        18,
+        45,
+        "https://static.klipy.com/server.gif",
+        "mar1",
+        False,
+        True,
+    )
+    await bot.db.pause(1, True)
+    await bot.db.save(1, 987654321012345678, 2, 29, "Europe/Bucharest", 18, 45, "mar1", True)
+    await bot.db.ensure_guild(2)
+    await bot.db.configure(
+        2, 7007199254740993, None, "UTC", 8, 0, "https://static.klipy.com/other-server.gif"
+    )
+    await bot.menu_actions["home"](value)
+    await click(bot, value, "Server tools")
+    with caplog.at_level(logging.INFO):
+        await click(bot, value, "Export server config")
+    args = value.followup.send.call_args.kwargs
+    assert args["ephemeral"]
+    assert args["allowed_mentions"].to_dict() == {"parse": []}
+    assert args["embed"].title == "Server config"
+    assert args["file"].filename == "birthdaybot-config-1.json"
+    raw = args["file"].fp.read()
+    document = json.loads(raw)
+    assert document["guild_id"] == "1"
+    assert document["settings"] == {
+        "channel_id": str(channel),
+        "alert_channel_id": str(alerts),
+        "timezone": "UTC",
+        "hour": 18,
+        "minute": 45,
+        "enabled": False,
+        "gif": "https://static.klipy.com/server.gif",
+        "leap": "mar1",
+        "public_birthdays": False,
+        "ping_everyone": True,
+    }
+    assert all(
+        secret not in raw
+        for secret in (
+            b"test-export-secret",
+            b"987654321012345678",
+            b"Europe/Bucharest",
+            b"other-server.gif",
+            b"7007199254740993",
+        )
+    )
+    assert "guild_config_exported guild=1 actor=20" in caplog.text
+    assert all(
+        secret not in caplog.text
+        for secret in ("server.gif", "Europe/Bucharest", "test-export-secret")
+    )
+    assert not bot.queue.pending
+
+
+async def test_server_config_export_rejects_stolen_revoked_cross_server_and_expired_menu(menu):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    await bot.menu_actions["tools"](value)
+    view = bot.active_views[(1, 20)]
+    export = next(
+        item for item in view.children if getattr(item, "label", None) == "Export server config"
+    )
+    value.user.id = 21
+    await export.callback(value)
+    assert "file" not in value.followup.send.call_args.kwargs
+    value.user.id = 20
+    value.user.guild_permissions = discord.Permissions.none()
+    await export.callback(value)
+    assert "Manage Server" in value.followup.send.call_args.args[0]
+    assert "file" not in value.followup.send.call_args.kwargs
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    value.guild_id = 2
+    await export.callback(value)
+    assert "file" not in value.followup.send.call_args.kwargs
+    value.guild_id = 1
+    view.stop()
+    await export.callback(value)
+    assert "expired" in value.followup.send.call_args.args[0]
+    assert "file" not in value.followup.send.call_args.kwargs
+
+
+async def test_server_config_export_rechecks_permissions_after_database_read(menu, monkeypatch):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    await bot.menu_actions["tools"](value)
+    read = bot.db.guild
+
+    async def revoke(guild_id):
+        settings = await read(guild_id)
+        value.user.guild_permissions = discord.Permissions.none()
+        return settings
+
+    monkeypatch.setattr(bot.db, "guild", revoke)
+    with pytest.raises(app_commands.MissingPermissions):
+        await click(bot, value, "Export server config")
+    value.followup.send.assert_not_awaited()
+    assert not bot.queue.pending
 
 
 async def test_everyone_setting_requires_channel_permission_and_explicit_save(menu):

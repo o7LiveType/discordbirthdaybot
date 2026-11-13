@@ -1,12 +1,14 @@
 """One slash launcher; all member and moderator actions live in private menus."""
 
 import functools
+import io
 import logging
 from datetime import UTC, datetime, timedelta
 
 import discord
 from discord import app_commands
 
+from .config_export import config_document
 from .delivery import celebration, channel_issues
 from .directory import open_directory
 from .embeds import birthday_date, birthday_embed, manager_embed
@@ -511,6 +513,7 @@ def install(bot):
             ("Channel deliveries", "channel_deliveries", 2),
             ("DM deliveries", "dm_deliveries", 2),
             ("Import birthdays", "import", 3),
+            ("Export server config", "export_config", 3),
             ("Main menu", "home", 3),
         ]
         for label, name, row in actions:
@@ -545,6 +548,23 @@ def install(bot):
     async def setup(interaction):
         view = SettingsWizard(bot, interaction.user.id, await bot.db.guild(interaction.guild_id))
         await show(bot, interaction, view.content(), view)
+
+    @action("export_config", admin=True)
+    async def export_config(interaction):
+        settings = await bot.db.guild(interaction.guild_id)
+        require_mod(interaction)
+        await private(
+            interaction,
+            None,
+            embed=manager_embed("Server config"),
+            file=discord.File(
+                io.BytesIO(config_document(settings, bot.config.gif)),
+                filename=f"birthdaybot-config-{interaction.guild_id}.json",
+            ),
+        )
+        log.info(
+            "guild_config_exported guild=%s actor=%s", interaction.guild_id, interaction.user.id
+        )
 
     @action("records", admin=True)
     async def records(interaction):
