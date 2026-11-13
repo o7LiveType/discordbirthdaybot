@@ -1,6 +1,8 @@
 """One serialized connection; every mutation commits with WAL + synchronous FULL."""
 
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,6 +12,9 @@ import aiosqlite
 
 from .sharing import FLAGS, Sharing
 
+log = logging.getLogger(__name__)
+SCHEMA_VERSION = 10
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
  guild_id INTEGER PRIMARY KEY, channel_id INTEGER, alert_channel_id INTEGER,
@@ -17,7 +22,8 @@ CREATE TABLE IF NOT EXISTS guilds (
  minute INTEGER NOT NULL DEFAULT 0 CHECK(minute BETWEEN 0 AND 59),
  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), gif TEXT NOT NULL DEFAULT '',
  leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only')),
- public_birthdays INTEGER NOT NULL DEFAULT 1 CHECK(public_birthdays IN (0,1))
+ public_birthdays INTEGER NOT NULL DEFAULT 1 CHECK(public_birthdays IN (0,1)),
+ ping_everyone INTEGER NOT NULL DEFAULT 0 CHECK(ping_everyone IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS birthdays (
  guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
@@ -89,7 +95,7 @@ CREATE INDEX IF NOT EXISTS birthdays_dm_date ON birthdays(month,day,guild_id) WH
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
 CREATE INDEX IF NOT EXISTS birthdays_visible_guild_date ON birthdays(guild_id,month,day,user_id) WHERE list_public=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=9;
+PRAGMA user_version=10;
 """
 
 
@@ -112,8 +118,15 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+            if version not in range(SCHEMA_VERSION + 1):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
+            existing = await (
+                await self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+                )
+            ).fetchone()
+            if version < SCHEMA_VERSION and existing:
+                await self._backup_before_migration(version)
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
                 if version == 1
@@ -159,11 +172,53 @@ class Database:
                             migration += f"ALTER TABLE {table} ADD COLUMN {key} INTEGER NOT NULL DEFAULT 0 CHECK({key} IN (0,1)); UPDATE {table} SET {key}=consent;"  # noqa: S608 - fixed table and flag names
             if version < 9:
                 migration += "DROP INDEX IF EXISTS birthdays_active_date; DROP INDEX IF EXISTS birthdays_public_guild_date;"
+            guild_columns = {
+                row[1]
+                for row in await (await self.conn.execute("PRAGMA table_info(guilds)")).fetchall()
+            }
+            if guild_columns and "ping_everyone" not in guild_columns:
+                migration += "ALTER TABLE guilds ADD COLUMN ping_everyone INTEGER NOT NULL DEFAULT 0 CHECK(ping_everyone IN (0,1));"
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
+            if version < SCHEMA_VERSION:
+                log.info("database_migrated from_version=%s to_version=%s", version, SCHEMA_VERSION)
         except BaseException:
             await self.conn.close()
             raise
+
+    async def _backup_before_migration(self, version):
+        """Capture committed WAL contents before changing an existing schema."""
+        directory = self.path.parent / "backups"
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = directory / (
+            f"{self.path.stem}-before-v{version}-to-v{SCHEMA_VERSION}-{stamp}-{uuid4().hex[:8]}.sqlite3"
+        )
+        created = False
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            created = True
+            os.close(fd)
+            async with aiosqlite.connect(destination, isolation_level=None) as snapshot:
+                await snapshot.execute("PRAGMA synchronous=FULL")
+                await self.conn.backup(snapshot, pages=256, sleep=0.1)
+                result = await (await snapshot.execute("PRAGMA integrity_check")).fetchall()
+                if [row[0] for row in result] != ["ok"]:
+                    raise RuntimeError("Backup integrity check failed.")
+        except BaseException as exc:
+            if created:
+                destination.unlink(missing_ok=True)
+            if not isinstance(exc, Exception):
+                raise
+            raise RuntimeError(
+                "Database backup failed; schema upgrade was not started. Check storage and permissions."
+            ) from exc
+        log.info(
+            "database_backup_created path=%s from_version=%s to_version=%s",
+            destination,
+            version,
+            SCHEMA_VERSION,
+        )
 
     @asynccontextmanager
     async def transaction(self, *, write=True):
@@ -207,6 +262,7 @@ class Database:
         gif,
         leap="feb28",
         public_birthdays=None,
+        ping_everyone=None,
     ):
         async with self.transaction() as conn:
             previous = await (
@@ -217,7 +273,8 @@ class Database:
             ).fetchone()
             await conn.execute(
                 """UPDATE guilds SET channel_id=?, alert_channel_id=?, timezone=?,
-                hour=?, minute=?, gif=?, leap=?, public_birthdays=COALESCE(?,public_birthdays) WHERE guild_id=?""",
+                hour=?, minute=?, gif=?, leap=?, public_birthdays=COALESCE(?,public_birthdays),
+                ping_everyone=COALESCE(?,ping_everyone) WHERE guild_id=?""",
                 (
                     channel_id,
                     alert_channel_id,
@@ -227,6 +284,7 @@ class Database:
                     gif,
                     leap,
                     public_birthdays,
+                    ping_everyone,
                     guild_id,
                 ),
             )

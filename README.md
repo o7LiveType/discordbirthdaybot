@@ -27,6 +27,8 @@ Set `TEST_GUILD_ID` to your test server ID for immediate guild command registrat
 
 Run `/birthdaybot` → **Server tools** → **Server settings**. Choose a birthday channel, optional moderator alert channel, announcement time, list access and leap-day behavior, then **Save settings**. Time uses hour/minute selectors; **Birthday GIF link** opens a validated URL form and shows an **Open GIF** link. Use **Server tools** → **Preview** and **Status** to check setup. Members choose **Set birthday**, select month/day/timezone, open **Sharing** to choose permissions, then **Save**. Draft changes take effect only after saving.
 
+**Everyone ping** is off by default. To enable it, allow the bot **Mention @everyone, @here, and All Roles** in the birthday channel, then select **Server settings** → **Everyone ping** → **On** → **Save settings**. Saving checks this permission; Administrator is unnecessary. Only scheduled server birthday posts can ping `@everyone`; previews, menus, alerts, directories and DMs cannot. Role pings stay blocked. If the permission is later removed, greetings still post without `@everyone` and a throttled moderator alert explains the problem. Each greeting invites everyone to wish the member a happy birthday. Member **Server posts** must still be on; **Post mentions** independently controls the birthday member's direct mention.
+
 ## Menu actions
 
 | Menu action | Permission | Behavior |
@@ -36,7 +38,7 @@ Run `/birthdaybot` → **Server tools** → **Server settings**. Choose a birthd
 | Set birthday / Update birthday | Member | Month, day and timezone; Sharing submenu; Save and Cancel |
 | Sharing | Member | Independent public-list, server-post, post-mention and birthday-DM permissions; Save and Cancel |
 | My birthday / Delete birthday | Member | View your own record or delete it after confirmation |
-| Server tools → Server settings | Manage Server | Channels, public/moderator-only lists, hour/minute selectors, leap-day rule and validated GIF form |
+| Server tools → Server settings | Manage Server | Channels, public/moderator-only lists, everyone ping, hour/minute selectors, leap-day rule and validated GIF form |
 | Server tools → All birthday records | Manage Server | Private paginated records, including opted-out dates |
 | Server tools → Delete member birthday | Manage Server | Native member selector, then deletion confirmation |
 | Server tools → Pause / resume | Manage Server | Buttons to pause or resume announcements and birthday DMs |
@@ -68,7 +70,7 @@ Birthdays belong to one server. **Public birthday browsing is ON by default**, i
 
 Only month/day is collected, never birth year or age. **Sharing** is a dedicated private menu with independent **Public list**, **Server posts**, **Birthday DMs**, and **Post mentions** controls. Open it directly from `/birthdaybot` to change permissions without editing the birthday. Save commits only those permissions; Cancel leaves them unchanged. Within Set/Update, Sharing → Apply changes the birthday draft; the birthday form's Save commits the date and all permissions together. No typing is required.
 
-Public-list visibility is independent of posts and DMs: members may hide their date from the calendar while still receiving greetings, or share their date while disabling greetings. Post mentions affect only server announcements; with mentions off the post uses an escaped display name and suppresses all mentions. With server posts off, post-mention permission has no effect. Server-wide moderator-only list access and the announcements pause still apply. Moderators may read all stored records; users can change only their own preferences. Turning off a permission prevents future work, while already-posted messages follow their existing 24-hour expiry.
+Public-list visibility is independent of posts and DMs: members may hide their date from the calendar while still receiving greetings, or share their date while disabling greetings. Post mentions affect only server announcements; with mentions off the post uses an escaped display name and suppresses the member's direct mention. The server's Everyone ping setting is independent. With server posts off, no announcement or everyone ping is sent for that birthday. Server-wide moderator-only list access and the announcements pause still apply. Moderators may read all stored records; users can change only their own preferences. Turning off a permission prevents future work, while already-posted messages follow their existing 24-hour expiry.
 
 Schema 9 copies every existing all-on/all-off choice to the four permissions, including pending imports; upgrading never enables a previously opted-out permission. CSV's legacy `opt_out`/`consent` choice maps to all four permissions when CSV sharing is enabled, and private imports keep all four off. Date/timezone edits preserve independent choices. Changing only DMs or posts does not invalidate public calendar snapshots; changing public-list visibility does. Sent and uncertain annual delivery records survive sharing changes, preserving duplicate prevention. Timezone and birthday values are never included in normal audit logs. Sharing audit events contain Discord IDs and permission booleans.
 
@@ -122,6 +124,8 @@ Create `.env` through the panel file manager or SFTP using `.env.example` as a t
 
 Keep `.env`, `data/`, and `logs/` persistent under `/home/container` across updates. Repository sync must update tracked source files only; **do not use `git clean -fdx` or wipe/reinstall the server volume**. Use fast-forward Git pulls and stop/restart the bot around updates. A single bot process must own the database: local process locking prevents a duplicate process using the same lock file, but does not coordinate replicas with separate volumes. Stop the test instance before starting production with the same bot token. Give shutdown time to cancel the scheduler and close/checkpoint SQLite; SIGTERM is handled. Health is visible as `bot_ready` and `scheduler_heartbeat` in the panel console.
 
+For panel updates, leave `AUTO_UPDATE=1` and restart the server. The egg pulls code and installs requirements; startup checks the schema of the database at `DATABASE_PATH` on that server. Before upgrading an existing schema, the bot creates a private, integrity-checked snapshot in `data/backups/` (or `backups/` beside a custom database path), then migrates the database in one transaction. Schema 10 adds Everyone ping with a default of off and preserves birthdays, sharing choices and delivery history. A failed backup or migration stops startup; a newer unsupported schema is refused. Watch for `database_backup_created`, `database_migrated`, then `bot_ready`. No manual migration command or local database upload is needed. Pushing code alone does not change the running panel instance.
+
 Runtime defaults: `DATABASE_PATH=data/birthdays.sqlite3`, `LOG_DIR=logs`, `LOG_LEVEL=INFO`. Log files rotate at 5 MB with five backups, plus panel stdout logs. Configure the panel's own log retention. Start with a modest memory allocation (for example 256 MiB) and observe actual usage before sizing larger servers.
 
 ## Standalone Linux service
@@ -141,6 +145,8 @@ Inspect status with `systemctl --user status discordbirthdaybot.service` and exi
 ## SQLite durability and backup
 
 Every connection used by the bot explicitly enables and verifies **`journal_mode=WAL` and `synchronous=FULL`**, with foreign keys, a five-second busy timeout, serialized `BEGIN IMMEDIATE` transactions, rollback on cancellation, schema version checks, and graceful WAL checkpointing. `FULL` causes a WAL sync per transaction commit; see [SQLite's documentation](https://sqlite.org/pragma.html#pragma_synchronous). Use a local persistent filesystem with reliable fsync semantics. Durability depends on the panel host, filesystem, and storage honoring flushes; SQLite cannot compensate for a lost volume or dishonest storage. Network shares are unsuitable for this WAL database.
+
+Schema upgrades automatically create a verified SQLite backup before changing an existing database, including committed WAL contents. These snapshots remain on the panel volume; they are not created on ordinary restarts and do not replace regular off-server backups. Backups are never automatically deleted. Keep protected copies elsewhere and manage retention.
 
 Make consistent live backups with SQLite's backup API:
 

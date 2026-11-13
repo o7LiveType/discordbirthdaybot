@@ -120,7 +120,7 @@ async def test_schema8_migration_preserves_on_off_and_pending_records(tmp_path):
         if not any(f"{key} INTEGER" in line for key in FLAGS)
         and not (line.startswith("CREATE INDEX") and any(f"WHERE {key}=" in line for key in FLAGS))
     )
-    legacy = legacy.replace("PRAGMA user_version=9;", "PRAGMA user_version=8;")
+    legacy = legacy.replace("PRAGMA user_version=10;", "PRAGMA user_version=8;")
     with sqlite3.connect(path) as conn:
         conn.executescript(legacy)
         conn.execute("INSERT INTO guilds(guild_id) VALUES (1)")
@@ -146,7 +146,7 @@ async def test_schema8_migration_preserves_on_off_and_pending_records(tmp_path):
         await db.close()
         await db.open()
         assert Sharing.from_record(await db.birthday(1, 10)) == flags
-        assert (await db.read("PRAGMA user_version"))[0][0] == 9
+        assert (await db.read("PRAGMA user_version"))[0][0] == 10
         assert (await db.read("PRAGMA integrity_check"))[0][0] == "ok"
         assert not await db.read("PRAGMA foreign_key_check")
     finally:

@@ -7,6 +7,7 @@ import discord
 import pytest
 
 from birthdaybot.delivery import Scheduler
+from birthdaybot.sharing import Sharing
 
 NOW = datetime(2026, 11, 10, 15, tzinfo=UTC)
 
@@ -52,6 +53,69 @@ async def test_send_once_across_repeat_ticks_and_restart(db):
     assert not mentions.everyone and not mentions.roles
     assert [u.id for u in mentions.users] == [2]
     assert channel.send.call_args.kwargs["nonce"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("personal_mention", [False, True])
+async def test_everyone_ping_is_explicit_and_independent_of_personal_mentions(
+    db, enabled, personal_mention
+):
+    scheduler, guild, channel = await fixture(db)
+    await db.configure(1, 100, None, "UTC", 9, 0, "", ping_everyone=enabled)
+    await db.set_sharing(1, 2, Sharing(True, True, True, personal_mention))
+    guild.fetch_member.return_value.display_name = "Example @everyone @here <@&123>"
+    await scheduler.tick(NOW)
+    await Scheduler(scheduler.bot).tick(NOW + timedelta(minutes=1))
+    channel.send.assert_awaited_once()
+    payload = channel.send.call_args.kwargs
+    assert payload["allowed_mentions"].everyone is enabled
+    assert payload["content"].count("@everyone") == int(enabled)
+    assert not payload["allowed_mentions"].roles
+    assert bool(payload["allowed_mentions"].users) is personal_mention
+    assert "Everyone, wish them a happy birthday!" in payload["embed"].description
+    dm = guild.fetch_member.return_value.create_dm.return_value.send.call_args.kwargs
+    assert dm["allowed_mentions"].to_dict() == {"parse": []}
+
+
+async def test_revoked_everyone_permission_still_posts_and_alerts_once(db):
+    scheduler, guild, channel = await fixture(db)
+    await db.configure(1, 100, None, "UTC", 9, 0, "", ping_everyone=True)
+    permissions = discord.Permissions.all()
+    permissions.mention_everyone = False
+    channel.permissions_for.return_value = permissions
+    await scheduler.tick(NOW)
+    payload = channel.send.call_args.kwargs
+    assert not payload["allowed_mentions"].everyone
+    assert "@everyone" not in payload["content"]
+    assert (await db.read("SELECT state FROM deliveries"))[0][0] == "sent"
+    notices = await db.read("SELECT code FROM notices")
+    assert [row["code"] for row in notices] == ["everyone_permission"]
+
+
+async def test_everyone_permission_is_rechecked_after_membership_lookup(db):
+    scheduler, guild, channel = await fixture(db)
+    await db.configure(1, 100, None, "UTC", 9, 0, "", ping_everyone=True)
+    permissions = discord.Permissions.all()
+    channel.permissions_for.return_value = permissions
+    member = guild.fetch_member.return_value
+
+    async def revoke_during_lookup(user_id):
+        permissions.mention_everyone = False
+        return member
+
+    guild.fetch_member.side_effect = revoke_during_lookup
+    await scheduler.tick(NOW)
+    assert not channel.send.call_args.kwargs["allowed_mentions"].everyone
+    assert "@everyone" not in channel.send.call_args.kwargs["content"]
+
+
+async def test_everyone_setting_does_not_override_server_post_optout(db):
+    scheduler, guild, channel = await fixture(db)
+    await db.configure(1, 100, None, "UTC", 9, 0, "", ping_everyone=True)
+    await db.set_sharing(1, 2, Sharing(True, False, True, True))
+    await scheduler.tick(NOW)
+    channel.send.assert_not_awaited()
+    guild.fetch_member.return_value.create_dm.return_value.send.assert_awaited_once()
 
 
 @pytest.mark.parametrize("change", ["optout", "paused", "future", "yesterday", "wrong_guild"])

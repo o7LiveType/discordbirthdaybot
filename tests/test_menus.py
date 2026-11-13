@@ -194,6 +194,79 @@ async def test_revoked_mod_access_blocks_queued_mutations_and_modal_submissions(
     submit.assert_not_awaited()
 
 
+async def test_everyone_setting_requires_channel_permission_and_explicit_save(menu):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.id, channel.guild.id = 100, 1
+    permissions = discord.Permissions.all()
+    channel.permissions_for.return_value = permissions
+    value.guild.id = 1
+    value.guild.get_channel.return_value = channel
+    await bot.db.ensure_guild(2)
+    await bot.menu_actions["setup"](value)
+    view = bot.active_views[(1, 20)]
+    assert not view.ping_everyone
+    await choose(view, value, 0, "everyone")
+    await choose(view, value, 1, "on")
+    assert not (await bot.db.guild(1))["ping_everyone"]
+    await click(bot, value, "Save settings")
+    assert "Choose a birthday channel" in value.followup.send.call_args.args[0]
+    assert not (await bot.db.guild(1))["ping_everyone"]
+    view.channel_id = 100
+    permissions.mention_everyone = False
+    await click(bot, value, "Save settings")
+    assert "Missing mention everyone" in value.followup.send.call_args.args[0]
+    assert not (await bot.db.guild(1))["ping_everyone"]
+    permissions.mention_everyone = True
+    value.user.guild_permissions = discord.Permissions.none()
+    await click(bot, value, "Save settings")
+    assert "Manage Server" in value.followup.send.call_args.args[0]
+    assert not (await bot.db.guild(1))["ping_everyone"]
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    await click(bot, value, "Save settings")
+    assert (await bot.db.guild(1))["ping_everyone"]
+    assert not (await bot.db.guild(2))["ping_everyone"]
+    assert "Everyone ping" in response_text(value)
+    assert value.edit_original_response.call_args.kwargs["allowed_mentions"].to_dict() == {
+        "parse": []
+    }
+    await bot.menu_actions["setup"](value)
+    view = bot.active_views[(1, 20)]
+    await choose(view, value, 0, "everyone")
+    await choose(view, value, 1, "off")
+    await click(bot, value, "Cancel")
+    assert (await bot.db.guild(1))["ping_everyone"]
+    await bot.menu_actions["setup"](value)
+    await choose(bot.active_views[(1, 20)], value, 0, "everyone")
+    await choose(bot.active_views[(1, 20)], value, 1, "off")
+    await click(bot, value, "Save settings")
+    assert not (await bot.db.guild(1))["ping_everyone"]
+
+
+async def test_everyone_setting_cannot_ping_in_preview_or_status(menu):
+    bot, value = menu
+    value.user.guild_permissions = discord.Permissions(manage_guild=True)
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.guild.id = value.guild.id = 1
+    permissions = discord.Permissions.all()
+    channel.permissions_for.return_value = permissions
+    value.guild.get_channel.return_value = channel
+    await bot.db.configure(1, 100, None, "UTC", 0, 0, "", ping_everyone=True)
+    await bot.menu_actions["preview"](value)
+    preview = value.edit_original_response.call_args.kwargs
+    assert preview["allowed_mentions"].to_dict() == {"parse": []}
+    assert "Everyone, wish them a happy birthday!" in preview["embed"].description
+    channel.send.assert_not_called()
+    permissions.mention_everyone = False
+    await bot.menu_actions["status"](value)
+    assert "Everyone ping: On" in response_text(value)
+    assert "Missing mention everyone" in response_text(value)
+    assert value.edit_original_response.call_args.kwargs["allowed_mentions"].to_dict() == {
+        "parse": []
+    }
+
+
 async def seed_job(bot, *, kind="channel", guild=1, user=20, year=2026):
     await bot.db.ensure_guild(guild)
     await bot.db.save(guild, user, 1, 1, "UTC", 0, 0, "feb28", True)

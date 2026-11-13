@@ -10,16 +10,18 @@ from .timeutil import due
 
 log = logging.getLogger(__name__)
 REQUIRED = ("view_channel", "send_messages", "embed_links", "read_message_history")
+EVERYONE_PERMISSION = "Birthday posts will send without @everyone. Allow Mention @everyone in the birthday channel or turn Everyone ping off."
 
 
-def channel_issues(channel, guild):
+def channel_issues(channel, guild, *, ping_everyone=False):
     if not isinstance(channel, discord.TextChannel) or channel.guild.id != guild.id:
         return ["Choose a text channel in this server."]
     if guild.me is None:
         return ["Bot membership is unavailable."]
     permissions = channel.permissions_for(guild.me)
+    required = REQUIRED + (("mention_everyone",) if ping_everyone else ())
     return [
-        f"Missing {name.replace('_', ' ')}." for name in REQUIRED if not getattr(permissions, name)
+        f"Missing {name.replace('_', ' ')}." for name in required if not getattr(permissions, name)
     ]
 
 
@@ -32,10 +34,7 @@ def celebration(user_id, gif, marker, *, preview=False, name=None):
     embed = discord.Embed(
         title="🎉 Happy Birthday! 🎂",
         color=0xF6B5D7,
-        description=(
-            "A little cake, a lot of joy, and a whole server cheering you on.\n\n"
-            f"Happy birthday, {recipient}! Have a wonderful day! ✨"
-        ),
+        description=(f"Happy birthday, {recipient}!\nEveryone, wish them a happy birthday!"),
     )
     if gif:
         embed.set_image(url=gif)
@@ -102,9 +101,15 @@ class Scheduler:
                 guild = self.bot.get_guild(settings["guild_id"])
                 if guild is None or not settings["enabled"]:
                     continue
-                issues = channel_issues(guild.get_channel(settings["channel_id"] or 0), guild)
+                channel = guild.get_channel(settings["channel_id"] or 0)
+                issues = channel_issues(channel, guild)
                 if issues:
                     await self.alert(settings, "configuration", " ".join(issues))
+                elif (
+                    settings["ping_everyone"]
+                    and not channel.permissions_for(guild.me).mention_everyone
+                ):
+                    await self.alert(settings, "everyone_permission", EVERYONE_PERMISSION)
             self._health_check = now
         processed = 0
         for snapshot in await self.db.candidates(now):
@@ -192,7 +197,11 @@ class Scheduler:
         if member.bot:
             await self.db.delivery_state(job, "skipped", error="Bot account")
             return
-        # Recheck the local day after membership IO, including a midnight crossing.
+        ping_everyone = bool(settings["ping_everyone"])
+        if ping_everyone and not channel.permissions_for(guild.me).mention_everyone:
+            ping_everyone = False
+            await self.alert(settings, "everyone_permission", EVERYONE_PERMISSION)
+        # Recheck the local day after membership/alert IO, including a midnight crossing.
         send_now = datetime.now(UTC) if self.bot.live_clock else now
         target = due(record, send_now)
         if target is None:
@@ -210,7 +219,7 @@ class Scheduler:
         )
         try:
             message = await channel.send(
-                content=f"🎂 {recipient}",
+                content=f"{'@everyone ' if ping_everyone else ''}🎂 {recipient}",
                 embed=celebration(
                     member.id,
                     settings["gif"] or self.bot.config.gif,
@@ -220,7 +229,7 @@ class Scheduler:
                 allowed_mentions=discord.AllowedMentions(
                     users=[member] if ping else False,
                     roles=False,
-                    everyone=False,
+                    everyone=ping_everyone,
                     replied_user=False,
                 ),
                 nonce=job["marker"],
@@ -241,12 +250,13 @@ class Scheduler:
             return
         await self.confirm_sent(job, message, now=send_now)
         log.info(
-            "delivery_sent guild=%s user=%s marker=%s message=%s lateness_seconds=%.0f",
+            "delivery_sent guild=%s user=%s marker=%s message=%s lateness_seconds=%.0f everyone=%s",
             guild.id,
             member.id,
             job["marker"],
             message.id,
             (send_now - target).total_seconds(),
+            ping_everyone,
         )
 
     async def retry(self, job, now, error):

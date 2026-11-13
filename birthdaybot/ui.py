@@ -40,6 +40,7 @@ async def defer(interaction):
 
 
 async def edit(interaction, **kwargs):
+    kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
     content = kwargs.get("content")
     view = kwargs.get("view")
     if (
@@ -863,6 +864,7 @@ class SettingsWizard(OwnedView):
         ("Announcement time", "time"),
         ("Birthday GIF link", "gif"),
         ("Birthday list access", "privacy"),
+        ("Everyone ping", "everyone"),
         ("February 29 birthdays", "leap"),
     ]
 
@@ -880,6 +882,7 @@ class SettingsWizard(OwnedView):
             log.warning("invalid_saved_gif_replaced guild=%s", self.guild_id)
         self.leap = settings["leap"]
         self.public_birthdays = bool(settings["public_birthdays"])
+        self.ping_everyone = bool(settings["ping_everyone"])
         self.section = "overview"
         self.build()
 
@@ -922,13 +925,15 @@ class SettingsWizard(OwnedView):
             self.add_item(channel)
             if self.section == "alerts":
                 self.add_item(button("Turn alerts off", self.clear_alerts, row=2))
-        elif self.section in {"privacy", "leap"}:
+        elif self.section in {"privacy", "leap", "everyone"}:
             options = (
                 [
                     ("Public — everyone can browse", "public"),
                     ("Private — moderators only", "private"),
                 ]
                 if self.section == "privacy"
+                else [("Off", "off"), ("On — ping @everyone", "on")]
+                if self.section == "everyone"
                 else [
                     ("Celebrate February 28 in non-leap years", "feb28"),
                     ("Celebrate March 1 in non-leap years", "mar1"),
@@ -938,10 +943,14 @@ class SettingsWizard(OwnedView):
             selected = (
                 ("public" if self.public_birthdays else "private")
                 if self.section == "privacy"
+                else ("on" if self.ping_everyone else "off")
+                if self.section == "everyone"
                 else self.leap
             )
             choice = discord.ui.Select(
-                placeholder="Birthday list access" if self.section == "privacy" else "February 29",
+                placeholder=dict(
+                    privacy="Birthday list access", everyone="Everyone ping", leap="February 29"
+                )[self.section],
                 row=1,
                 options=[
                     discord.SelectOption(label=label, value=value, default=value == selected)
@@ -953,6 +962,8 @@ class SettingsWizard(OwnedView):
             async def choose_option(interaction):
                 if section == "privacy":
                     self.public_birthdays = choice.values[0] == "public"
+                elif section == "everyone":
+                    self.ping_everyone = choice.values[0] == "on"
                 else:
                     self.leap = choice.values[0]
                 self.build()
@@ -1033,6 +1044,7 @@ class SettingsWizard(OwnedView):
             f"Announcement time: **{self.hour:02}:{self.minute:02} in each member's timezone**\n"
             f"Birthday GIF: [Open GIF]({self.gif or default})\n"
             f"Birthday lists: **{'Public' if self.public_birthdays else 'Moderators only'}**\n"
+            f"Everyone ping: **{'On' if self.ping_everyone else 'Off'}**\n"
             f"February 29: **{ {'feb28': 'February 28', 'mar1': 'March 1', 'leap_only': 'leap years only'}[self.leap] }**\n\n"
         )
 
@@ -1048,6 +1060,7 @@ class SettingsWizard(OwnedView):
             ("Moderator alerts", f"<#{self.alert_id}>" if self.alert_id else "Off"),
             ("Announcement time", f"**{self.hour:02}:{self.minute:02}** in each member's timezone"),
             ("Birthday lists", "Public" if self.public_birthdays else "Moderators only"),
+            ("Everyone ping", "On" if self.ping_everyone else "Off"),
             (
                 "February 29",
                 {"feb28": "February 28", "mar1": "March 1", "leap_only": "Leap years only"}[
@@ -1093,8 +1106,14 @@ class SettingsWizard(OwnedView):
     async def save(self, interaction):
         guild = interaction.guild
         issues = (
-            channel_issues(guild.get_channel(self.channel_id), guild) if self.channel_id else []
+            channel_issues(
+                guild.get_channel(self.channel_id), guild, ping_everyone=self.ping_everyone
+            )
+            if self.channel_id
+            else []
         )
+        if self.ping_everyone and not self.channel_id:
+            issues.append("Choose a birthday channel before enabling Everyone ping.")
         if self.alert_id:
             issues += channel_issues(guild.get_channel(self.alert_id), guild)
         if not (self.gif or self.bot.config.gif):
@@ -1115,6 +1134,7 @@ class SettingsWizard(OwnedView):
                 self.gif,
                 self.leap,
                 self.public_birthdays,
+                self.ping_everyone,
             )
         self.stop()
         embed = self.make_embed(interaction)
@@ -1126,10 +1146,11 @@ class SettingsWizard(OwnedView):
             view=navigation(self.bot, self.owner, self.guild_id, admin=True),
         )
         log.info(
-            "guild_configured guild=%s actor=%s channel=%s",
+            "guild_configured guild=%s actor=%s channel=%s everyone=%s",
             self.guild_id,
             self.owner,
             self.channel_id,
+            self.ping_everyone,
         )
 
     async def cancel(self, interaction):

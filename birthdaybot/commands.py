@@ -613,7 +613,9 @@ def install(bot):
     async def preview(interaction):
         settings = await bot.db.guild(interaction.guild_id)
         issues = channel_issues(
-            interaction.guild.get_channel(settings["channel_id"] or 0), interaction.guild
+            interaction.guild.get_channel(settings["channel_id"] or 0),
+            interaction.guild,
+            ping_everyone=bool(settings["ping_everyone"]),
         )
         await result(
             interaction,
@@ -639,7 +641,9 @@ def install(bot):
         mode = (await bot.db.read("PRAGMA journal_mode"))[0][0]
         sync = (await bot.db.read("PRAGMA synchronous"))[0][0]
         issues = channel_issues(
-            interaction.guild.get_channel(settings["channel_id"] or 0), interaction.guild
+            interaction.guild.get_channel(settings["channel_id"] or 0),
+            interaction.guild,
+            ping_everyone=bool(settings["ping_everyone"]),
         )
         last = bot.scheduler.last_success
         age = (
@@ -653,6 +657,7 @@ def install(bot):
             f"Gateway latency: {bot.latency * 1000:.0f}ms\nSQLite: {mode.upper()}, synchronous={'FULL' if sync == 2 else sync}\n"
             f"Announcements: {'enabled' if settings['enabled'] else 'PAUSED'}\n"
             f"Birthday lists: {'public' if settings['public_birthdays'] else 'moderators only'}\n"
+            f"Everyone ping: {'On' if settings['ping_everyone'] else 'Off'}\n"
             f"Channel: {settings['channel_id'] or 'NOT SET'}\nAlerts: {settings['alert_channel_id'] or 'logs only'}\n"
             f"GIF configured: {bool(settings['gif'] or bot.config.gif)}\n"
             "Deliveries: "
