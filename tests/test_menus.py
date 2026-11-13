@@ -16,6 +16,13 @@ from birthdaybot.delivery import Scheduler
 from birthdaybot.ui import BirthdayWizard, FieldsModal, SettingsWizard
 
 
+def response_text(value):
+    payload = value.edit_original_response.call_args.kwargs
+    return str(payload.get("content") or "") + str(
+        payload["embed"].to_dict() if payload.get("embed") else ""
+    )
+
+
 @pytest.fixture
 async def menu(db):
     bot = BirthdayBot(Config("test"))
@@ -70,7 +77,7 @@ async def test_member_set_optout_update_and_delete_entirely_by_menu(menu):
     await click(bot, value, "Sharing: ON")
     await click(bot, value, "Save")
     assert (await bot.db.birthday(1, 20))["consent"] == 0
-    assert "opted out" in value.edit_original_response.call_args.kwargs["content"]
+    assert "opted out" in response_text(value)
     await click(bot, value, "Main menu")
     await click(bot, value, "Update birthday")
     assert bot.active_views[(1, 20)].opt_out
@@ -112,7 +119,7 @@ async def test_timezone_search_errors_ambiguity_and_canonical_confirmation(menu)
     assert view.zone == "America/New_York" and not view.browsing_zone
     await view.save(value)
     assert (await bot.db.birthday(1, 20))["timezone"] == "America/New_York"
-    assert "UTC-" in value.edit_original_response.call_args.kwargs["content"]
+    assert "UTC-" in response_text(value)
 
 
 async def test_other_timezone_modal_opens_before_defer_and_submission_is_queued(menu):
@@ -294,7 +301,7 @@ async def test_long_valid_gif_link_remains_clickable_without_oversized_message(m
     assert (await bot.db.guild(1))["gif"] == view.gif
     assert value.edit_original_response.call_args.kwargs["content"] is None
     await click(bot, value, "Main menu")
-    assert value.edit_original_response.call_args.kwargs["embed"] is None
+    assert value.edit_original_response.call_args.kwargs["embed"].title == "🎂 Birthday manager"
 
 
 async def test_history_search_is_bounded_and_can_continue_older_messages(menu, monkeypatch):
@@ -319,10 +326,10 @@ async def test_history_search_is_bounded_and_can_continue_older_messages(menu, m
     monkeypatch.setattr(bot, "get_partial_messageable", lambda channel_id: channel)
     await click(bot, value, "Find posted message")
     assert review.before == 1501
-    assert "batch of 500" in value.edit_original_response.call_args.kwargs["content"]
+    assert "batch of 500" in response_text(value)
     await click(bot, value, "Search older messages")
     assert review.before is None
-    assert "remaining history" in value.edit_original_response.call_args.kwargs["content"]
+    assert "remaining history" in response_text(value)
     assert (await review.job())["state"] == "uncertain"
     assert all(call["limit"] == 500 and call["oldest_first"] is False for call in calls)
 
@@ -570,10 +577,7 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     await view.confirm(value)  # Explicit review is required first.
     assert await bot.db.birthday(1, first) is None
     await click(bot, value, "Review import")
-    assert (
-        "0 birthdays will have public sharing"
-        in value.edit_original_response.call_args.kwargs["content"]
-    )
+    assert "0 birthdays will have public sharing" in response_text(value)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 0
     assert await bot.db.birthday(1, second) is None
@@ -604,19 +608,13 @@ async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(m
     await upload_csv(bot, value, view, data)
     await click(bot, value, "CSV sharing: OFF")
     await click(bot, value, "Review import")
-    assert (
-        "2 birthdays will have public sharing"
-        in value.edit_original_response.call_args.kwargs["content"]
-    )
+    assert "2 birthdays will have public sharing" in response_text(value)
     await bot.db.save(1, second, 9, 9, "Asia/Tokyo", 0, 0, "feb28", False)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 1
     assert (await bot.db.birthday(1, second))["month"] == 9
     assert (await bot.db.birthday(1, second))["consent"] == 0
-    assert (
-        "1 newly existing records skipped"
-        in value.edit_original_response.call_args.kwargs["content"]
-    )
+    assert "1 newly existing records skipped" in response_text(value)
 
 
 async def test_import_verifies_members_and_skips_existing_and_departed_users(menu):

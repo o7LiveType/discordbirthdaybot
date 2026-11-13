@@ -8,6 +8,7 @@ import discord
 
 from .config import DEFAULT_GIF, gif_url
 from .delivery import channel_issues
+from .embeds import birthday_embed, manager_embed, text_embed
 from .timeutil import anniversary, format_offset, timezone, timezone_label
 from .timezone_catalog import REGIONS, catalog, search_timezones
 
@@ -38,7 +39,17 @@ async def defer(interaction):
 
 async def edit(interaction, **kwargs):
     content = kwargs.get("content")
-    if isinstance(content, str) and len(content) > 2000:
+    view = kwargs.get("view")
+    if (
+        isinstance(content, str)
+        and kwargs.get("embed") is None
+        and isinstance(view, OwnedView)
+        and not getattr(view, "public", False)
+    ):
+        renderer = getattr(view, "make_embed", None)
+        kwargs["content"] = None
+        kwargs["embed"] = renderer(interaction) if renderer else text_embed(content)
+    elif isinstance(content, str) and len(content) > 2000:
         # A valid media URL can be 2048 characters on its own. Keep the full
         # clickable link in an embed rather than sending an invalid message.
         kwargs["content"] = None
@@ -458,6 +469,7 @@ class BirthdayWizard(OwnedView):
         self.day_page = int(bool(self.day and self.day >= 25))
         self.completed = False
         self.public_birthdays = bool(settings["public_birthdays"])
+        self.hour, self.minute, self.leap = settings["hour"], settings["minute"], settings["leap"]
         self.zone_valid = bool(timezone_verified)
         self.browsing_zone = False
         self.zone_browser = TimezoneBrowser(self)
@@ -484,6 +496,27 @@ class BirthdayWizard(OwnedView):
                 else "Birthday browsing is restricted to moderators in this server. "
             )
             + "Turn sharing OFF to hide your date and stop birthday posts and DMs."
+        )
+
+    def make_embed(self, interaction):
+        if self.browsing_zone:
+            return text_embed(self.zone_browser.content())
+        record = dict(
+            month=self.month,
+            day=self.day,
+            timezone=self.zone,
+            hour=self.hour,
+            minute=self.minute,
+            leap=self.leap,
+            consent=not self.opt_out,
+        )
+        return birthday_embed(
+            interaction.user,
+            record,
+            draft=True,
+            zone_valid=self.zone_valid,
+            public_birthdays=self.public_birthdays,
+            notice=self.zone_notice + "\nChoose your details below, then press **Save**.",
         )
 
     def build(self):
@@ -669,25 +702,25 @@ class BirthdayWizard(OwnedView):
             )
         self.completed = True
         self.stop()
-        result = (
-            f"✅ Birthday {'updated' if self.update else 'saved'}: **{calendar.month_name[self.month]} {self.day}**\n"
-            f"Timezone: **{timezone_label(self.zone)}**\n"
-            + (
-                "You opted out of public birthday lists, announcements and birthday DMs."
-                if self.opt_out
-                else "We'll celebrate in the birthday channel and DM you with the server's name on your birthday."
-                + (
-                    " Your month and day are also shared in the public birthday list."
-                    if settings["public_birthdays"]
-                    else ""
-                )
-            )
-            + "\nUse the main menu to update or delete your birthday."
+        saved = dict(
+            month=self.month,
+            day=self.day,
+            timezone=self.zone,
+            hour=settings["hour"],
+            minute=settings["minute"],
+            leap=settings["leap"],
+            consent=not self.opt_out,
         )
-        if not settings["channel_id"] or not settings["enabled"]:
-            result += "\n⚠️ A moderator needs to enable the birthday channel before announcements can post."
-        await interaction.edit_original_response(
-            content=result, view=navigation(self.bot, self.owner, self.guild_id)
+        await edit(
+            interaction,
+            content=None,
+            embed=birthday_embed(
+                interaction.user,
+                saved,
+                settings=settings,
+                notice=f"✅ Birthday {'updated' if self.update else 'saved'}.",
+            ),
+            view=navigation(self.bot, self.owner, self.guild_id),
         )
         log.info(
             "birthday_saved guild=%s user=%s action=%s opted_out=%s",
@@ -723,7 +756,8 @@ class Confirm(OwnedView):
         await self.action(interaction)
         self.completed = True
         self.stop()
-        await interaction.edit_original_response(
+        await edit(
+            interaction,
             content="✅ Birthday record deleted from this server.",
             view=navigation(self.bot, self.owner, interaction.guild_id, admin=self.admin),
         )
@@ -923,6 +957,31 @@ class SettingsWizard(OwnedView):
             "Choose a setting from the menu, then **Save settings**. **00:00 is local midnight.** "
             "The time and leap-day rule apply to every birthday in this server."
         )
+
+    def make_embed(self, interaction):
+        default = getattr(self.bot.config, "gif", DEFAULT_GIF)
+        default = gif_url(default) if isinstance(default, str) and default else DEFAULT_GIF
+        embed = manager_embed(
+            "Birthday bot settings",
+            f"Choose a setting, then press **Save settings**.\n[Open GIF]({self.gif or default})",
+        )
+        for name, value in (
+            ("Birthday channel", f"<#{self.channel_id}>" if self.channel_id else "Not set"),
+            ("Moderator alerts", f"<#{self.alert_id}>" if self.alert_id else "Off"),
+            ("Announcement time", f"**{self.hour:02}:{self.minute:02}** in each member's timezone"),
+            ("Birthday lists", "Public" if self.public_birthdays else "Moderators only"),
+            (
+                "February 29",
+                {"feb28": "February 28", "mar1": "March 1", "leap_only": "Leap years only"}[
+                    self.leap
+                ],
+            ),
+        ):
+            embed.add_field(name=name, value=value, inline=True)
+        embed.set_footer(
+            text="00:00 is local midnight · Opted-out dates stay hidden publicly · Changes apply after Save settings."
+        )
+        return embed
 
     async def edit_gif(self, interaction):
         async def submit(submission, values):

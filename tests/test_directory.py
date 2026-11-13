@@ -166,7 +166,8 @@ async def test_main_menu_navigation_does_not_requeue_itself(db):
     bot.queue.start()
     try:
         await next(b for b in view.children if b.label == "Set birthday").callback(interaction)
-        assert "Your birthday" in interaction.edit_original_response.call_args.kwargs["content"]
+        assert interaction.edit_original_response.call_args.kwargs["content"] is None
+        assert interaction.edit_original_response.call_args.kwargs["embed"].title == "Your birthday"
         assert not bot.queue.pending
     finally:
         await bot.queue.close()

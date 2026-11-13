@@ -1,6 +1,5 @@
 """One slash launcher; all member and moderator actions live in private menus."""
 
-import calendar
 import functools
 import logging
 from datetime import UTC, datetime, timedelta
@@ -10,7 +9,7 @@ from discord import app_commands
 
 from .delivery import celebration, channel_issues
 from .directory import open_directory
-from .timeutil import timezone_label
+from .embeds import birthday_embed, manager_embed
 from .ui import (
     BirthdayWizard,
     Confirm,
@@ -39,7 +38,7 @@ async def show(bot, interaction, content, view, *, embed=None):
     await defer(interaction)
     await edit(
         interaction,
-        content=content,
+        content=None if embed is not None else content,
         embed=embed,
         view=view,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -82,15 +81,21 @@ class PrivateList(OwnedView):
     async def previous(self, interaction):
         self.page -= 1
         await defer(interaction)
-        await interaction.edit_original_response(
-            content=await self.render(), view=self, allowed_mentions=discord.AllowedMentions.none()
+        await edit(
+            interaction,
+            content=await self.render(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def next(self, interaction):
         self.page += 1
         await defer(interaction)
-        await interaction.edit_original_response(
-            content=await self.render(), view=self, allowed_mentions=discord.AllowedMentions.none()
+        await edit(
+            interaction,
+            content=await self.render(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
 
@@ -345,7 +350,8 @@ def install(bot):
 
     async def result(interaction, content, *, admin=False, embed=None):
         await defer(interaction)
-        await interaction.edit_original_response(
+        await edit(
+            interaction,
             content=content,
             embed=embed,
             view=navigation(bot, interaction.user.id, interaction.guild_id, admin=admin),
@@ -367,11 +373,39 @@ def install(bot):
             actions.append(("Server tools", "tools", 2))
         for label, name, row in actions:
             view.add_item(button(label, bot.menu_actions[name], row=row))
+        record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
+        if record:
+            card = birthday_embed(
+                interaction.user, record, settings=await bot.db.guild(interaction.guild_id)
+            )
+            card.title = "Birthday manager"
+        else:
+            card = manager_embed(
+                "🎂 Birthday manager",
+                "Browse server birthdays or save your own month, day and timezone.",
+            )
+            card.add_field(
+                name="Your birthday",
+                value="Choose **Set birthday** to get started, or **Update birthday** to change your details.",
+                inline=False,
+            )
+            card.add_field(
+                name="Server birthdays",
+                value="Open **View birthdays** for the calendar or **Monthly summary** for totals.",
+                inline=False,
+            )
+        if moderator(interaction):
+            card.add_field(
+                name="Moderation",
+                value="**Server tools** opens settings, records and CSV import.",
+                inline=False,
+            )
         await show(
             bot,
             interaction,
             "**🎂 Birthday bot**\nBrowse the server calendar or manage your own birthday.",
             view,
+            embed=card,
         )
 
     async def open_member(interaction, *, update):
@@ -426,7 +460,10 @@ def install(bot):
             return
         await result(
             interaction,
-            f"🎂 Your birthday: **{calendar.month_name[record['month']]} {record['day']}**\nTimezone: **{timezone_label(record['timezone'])}**\nSharing: **{'ON' if record['consent'] else 'OFF (opted out)'}**\nUse the main menu to update or delete it.",
+            None,
+            embed=birthday_embed(
+                interaction.user, record, settings=await bot.db.guild(interaction.guild_id)
+            ),
         )
 
     @action("directory")

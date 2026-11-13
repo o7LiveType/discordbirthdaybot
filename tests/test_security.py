@@ -133,7 +133,11 @@ async def test_save_is_private_uses_current_moderator_settings_and_keeps_optout(
     view.month, view.day, view.zone = 11, 10, "America/New_York"
     await db.configure(1, 100, None, "UTC", 10, 30, "", "mar1")
     value = interaction()
-    value.response.defer = AsyncMock()
+
+    async def acknowledge(**kwargs):
+        value.response.is_done.return_value = True
+
+    value.response.defer = AsyncMock(side_effect=acknowledge)
     value.edit_original_response = AsyncMock()
     await view.save(value)
     record = await db.birthday(1, 10)
@@ -141,7 +145,7 @@ async def test_save_is_private_uses_current_moderator_settings_and_keeps_optout(
     assert (record["hour"], record["minute"], record["leap"]) == (10, 30, "mar1")
     assert value.response.defer.call_args.kwargs["ephemeral"]
     assert value.edit_original_response.call_args.kwargs["view"] is None
-    assert "opted out" in value.edit_original_response.call_args.kwargs["content"]
+    assert "opted out" in str(value.edit_original_response.call_args.kwargs["embed"].to_dict())
 
 
 def test_logs_redact_bot_token_and_authorization():
