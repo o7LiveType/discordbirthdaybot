@@ -77,7 +77,7 @@ async def test_member_set_optout_update_and_delete_entirely_by_menu(menu):
     await click(bot, value, "Sharing: ON")
     await click(bot, value, "Save")
     assert (await bot.db.birthday(1, 20))["consent"] == 0
-    assert "opted out" in response_text(value)
+    assert "Posts: Off · DMs: Off" in response_text(value)
     await click(bot, value, "Main menu")
     await click(bot, value, "Update birthday")
     assert bot.active_views[(1, 20)].opt_out
@@ -98,7 +98,7 @@ async def test_timezone_search_errors_ambiguity_and_canonical_confirmation(menu)
     view = bot.active_views[(1, 20)]
     view.month, view.day = 1, 1
     await view.search_zone(value, "@everyone\n<unsafe>")
-    assert "❌" in view.content() and "@everyone" not in view.content()
+    assert view.zone_browser.invalid and "@everyone" not in view.content()
     assert next(
         item for item in view.children if getattr(item, "label", None) == "Use this timezone"
     ).disabled
@@ -108,13 +108,13 @@ async def test_timezone_search_errors_ambiguity_and_canonical_confirmation(menu)
     await view.search_zone(value, "Indiana")
     matches = view.zone_browser.results()
     assert 1 < len(matches) <= 25
-    assert "Choose your timezone" in view.content()
+    assert view.zone_browser.selected is None
     assert len(next(item for item in view.children if item.row == 2).options) <= 25
     await choose(view, value, 2, matches[0].name)
     assert view.zone_browser.selected == matches[0].name
     await view.search_zone(value, "new york")
     assert view.zone_browser.selected == "America/New_York" and view.zone == "UTC"
-    assert "Valid match" in view.content() and "UTC-" in view.content()
+    assert "America/New_York" in view.content() and "UTC-" in view.content()
     await click(bot, value, "Use this timezone")
     assert view.zone == "America/New_York" and not view.browsing_zone
     await view.save(value)
@@ -282,7 +282,7 @@ async def test_expired_timezone_form_cannot_modify_a_replacement_menu(menu):
     modal.inputs["zone"]._value = "Asia/Tokyo"
     await modal.on_submit(value)
     assert old.zone == "UTC" and old.is_finished()
-    assert "no longer have access" in value.followup.send.call_args.args[0]
+    assert "expired" in value.followup.send.call_args.args[0]
 
 
 async def test_long_valid_gif_link_remains_clickable_without_oversized_message(menu):
@@ -301,7 +301,7 @@ async def test_long_valid_gif_link_remains_clickable_without_oversized_message(m
     assert (await bot.db.guild(1))["gif"] == view.gif
     assert value.edit_original_response.call_args.kwargs["content"] is None
     await click(bot, value, "Main menu")
-    assert value.edit_original_response.call_args.kwargs["embed"].title == "🎂 Birthday manager"
+    assert value.edit_original_response.call_args.kwargs["embed"].title == "Birthday manager"
 
 
 async def test_history_search_is_bounded_and_can_continue_older_messages(menu, monkeypatch):
@@ -410,7 +410,7 @@ async def test_invalid_timezone_search_can_retry_immediately_without_changing_zo
     first.inputs["zone"]._value = "<unsafe>"
     await first.on_submit(value)
     assert view.zone == "UTC" and view.browsing_zone
-    assert "❌" in view.content()
+    assert view.zone_browser.invalid
     assert await bot.db.birthday(1, 20) is None
     value.response.defer.reset_mock()
     await click(bot, value, "Search")  # No timezone dropdown change needed.
@@ -419,12 +419,12 @@ async def test_invalid_timezone_search_can_retry_immediately_without_changing_zo
     assert second is not first
     second.inputs["zone"]._value = "NoSuchCityAnywhere"
     await second.on_submit(value)
-    assert "No matches" in view.content() and view.zone == "UTC"
+    assert "0 matches" in view.content() and view.zone == "UTC"
     await click(bot, value, "Search")
     third = value.response.send_modal.call_args.args[0]
     third.inputs["zone"]._value = "Kathmandu"
     await third.on_submit(value)
-    assert "Local clock there" in view.content() and "UTC+05:45" in view.content()
+    assert "Local time:" in view.content() and "UTC+05:45" in view.content()
     assert view.zone == "UTC"  # Still needs the explicit Use button.
     await click(bot, value, "Use this timezone")
     assert view.zone == "Asia/Kathmandu" and not view.browsing_zone
@@ -577,7 +577,7 @@ async def test_import_upload_preview_confirmation_pending_and_claim_flow(menu):
     await view.confirm(value)  # Explicit review is required first.
     assert await bot.db.birthday(1, first) is None
     await click(bot, value, "Review import")
-    assert "0 birthdays will have public sharing" in response_text(value)
+    assert "Public list + posts + DMs: 0 members" in response_text(value)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 0
     assert await bot.db.birthday(1, second) is None
@@ -608,13 +608,13 @@ async def test_import_explicit_sharing_and_concurrent_user_edits_are_preserved(m
     await upload_csv(bot, value, view, data)
     await click(bot, value, "CSV sharing: OFF")
     await click(bot, value, "Review import")
-    assert "2 birthdays will have public sharing" in response_text(value)
+    assert "Public list + posts + DMs: 2 members" in response_text(value)
     await bot.db.save(1, second, 9, 9, "Asia/Tokyo", 0, 0, "feb28", False)
     await click(bot, value, "Confirm import")
     assert (await bot.db.birthday(1, first))["consent"] == 1
     assert (await bot.db.birthday(1, second))["month"] == 9
     assert (await bot.db.birthday(1, second))["consent"] == 0
-    assert "1 newly existing records skipped" in response_text(value)
+    assert "Additional skips: 1" in response_text(value)
 
 
 async def test_import_verifies_members_and_skips_existing_and_departed_users(menu):
@@ -642,7 +642,7 @@ async def test_import_verifies_members_and_skips_existing_and_departed_users(men
     assert await bot.db.pending_birthday(1, second) is None
     assert await bot.db.pending_birthday(1, third)
     listing = await PrivateList(bot, 20, 1).render()
-    assert "NEEDS TIMEZONE" in listing and str(third) in listing
+    assert "Timezone required" in listing and str(third) in listing
 
 
 async def test_import_failed_member_checks_block_commit_and_support_retry(menu):

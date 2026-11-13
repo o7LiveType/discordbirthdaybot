@@ -82,13 +82,13 @@ class DirectoryView(OwnedView):
             self.stop()
             await edit(
                 interaction,
-                content="This birthday directory has expired or its visibility changed. Use `/birthdaybot` to reopen it.",
+                content="Directory expired. Open `/birthdaybot`.",
                 embed=None,
                 view=None,
             )
             return False
         if not self.queue.admit((interaction.guild_id, interaction.user.id)):
-            await private(interaction, "Please slow down. Menu limit: 12 actions per 10 seconds.")
+            await private(interaction, "Limit: 12 actions per 10 seconds.")
             return False
         return True
 
@@ -106,13 +106,11 @@ class DirectoryView(OwnedView):
         )
         self.page, self.pages = data["page"], data["pages"]
         self.build(data["months"])
-        counts = f"**{data['configured']}** birthdays configured in this server\n" + (
-            f"**{data['visible']}** shared publicly · announcement opt-outs are hidden"
-            if self.public
-            else "Moderator view · includes opted-out records"
+        counts = f"{data['configured']} total · " + (
+            f"{data['visible']} public" if self.public else "Moderators only"
         )
         embed = discord.Embed(
-            title="🎂 Birthday calendar" if not self.summary else "📅 Birthdays by month",
+            title="Birthday calendar" if not self.summary else "Birthdays by month",
             description=counts,
             color=0xF6B5D7,
         )
@@ -130,11 +128,11 @@ class DirectoryView(OwnedView):
             ]
             embed.add_field(
                 name=calendar.month_name[self.month] if self.month else "January → December",
-                value="\n".join(lines) or "No birthdays to show.",
+                value="\n".join(lines) or "No birthdays.",
                 inline=False,
             )
             embed.set_footer(
-                text=f"Page {self.page + 1}/{self.pages} · {data['filtered']} birthdays in this view"
+                text=f"Page {self.page + 1}/{self.pages} · {data['filtered']} birthdays"
             )
         return {"content": None, "embed": embed, "view": self}
 

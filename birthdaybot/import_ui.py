@@ -55,9 +55,7 @@ class ImportUpload(discord.ui.Modal):
             interaction.user.id,
             type(error).__name__,
         )
-        await private(
-            interaction, "The file could not be read. Upload it again; no birthdays were imported."
-        )
+        await private(interaction, "File unreadable. Upload it again.")
 
 
 class ImportView(OwnedView):
@@ -157,30 +155,28 @@ class ImportView(OwnedView):
         self.add_item(button("Cancel / Server tools", self.bot.menu_actions["tools"], row=3))
 
     def content(self):
-        lines = [
-            "**Import birthdays · moderators only**",
-            "Upload CSV → verify → review → confirm. Existing saved or pending birthdays are always skipped.",
-            "Required: `user_id` (or `member_id`), `month`, `day`. Optional: `timezone`, `opt_out` (or `consent`/`sharing`).",
-            "Month may be a number or English name. Timezone must be an IANA name, e.g. `America/New_York`. Birth years and extra columns are discarded.",
-            "**Private import is the default.** CSV sharing ON honors explicit opt-in values and can enable public lists, birthday posts and DMs. Blank sharing stays OFF.",
-            "Missing timezone → pending: hidden, no posts/DMs, and the member confirms their timezone through Set/Update birthday.",
-        ]
+        lines = ["**Import birthdays**"]
         if not self.parsed:
-            return (
-                "\n".join(lines)
-                + "\nMaximum 500 rows / 256 KiB per file. Use CSV template for the column names."
+            return "\n".join(
+                lines
+                + [
+                    "CSV · UTF-8 · 500 rows · 256 KiB",
+                    "Required: `user_id`, `month`, `day`",
+                    "Optional: `timezone` (IANA), `opt_out` (true/false)",
+                    "Existing records skipped. Missing timezone → pending.",
+                ]
             )
         counts = {
             state: list(self.statuses.values()).count(state)
             for state in {"member", "existing", "left", "unverified"}
         }
         lines += [
-            f"\n**{self.parsed.total} CSV rows · {len(self.parsed.issues)} errors · {self.phase}**",
+            f"{self.parsed.total} rows · {len(self.parsed.issues)} errors · {self.phase}",
             f"Verified members: {counts['member']} · existing: {counts['existing']} · departed/not found: {counts['left']} · unverified: {counts['unverified']}",
             f"Checked: {len(self.statuses)}/{len(self.parsed.rows)} · ignored columns: {self.parsed.ignored_columns}",
         ]
         if self.parsed.issues:
-            lines += ["**Fix the CSV errors and upload it again. Nothing has been imported.**"]
+            lines += ["Fix errors before importing."]
             values = self.parsed.issues
             lines += [
                 f"Line {issue.line}: {issue.message}"
@@ -188,7 +184,7 @@ class ImportView(OwnedView):
             ]
         else:
             lines += [
-                f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'NEEDS TIMEZONE'} · {self.statuses.get(row.user_id, 'waiting')}"
+                f"Line {row.line}: <@{row.user_id}> · {row.month:02}/{row.day:02} · {row.timezone or 'Timezone required'} · {self.statuses.get(row.user_id, 'waiting')}"
                 for row in self.parsed.rows[self.page * 10 : (self.page + 1) * 10]
             ]
         return "\n".join(lines)
@@ -209,7 +205,7 @@ class ImportView(OwnedView):
     async def template(self, interaction):
         await private(
             interaction,
-            "Fill in Discord user IDs, month/day and optional IANA timezone / opt_out. Save as UTF-8 CSV. Blank opt_out stays private; birth years are discarded.",
+            "UTF-8 CSV. Blank sharing stays off.",
             file=discord.File(io.BytesIO(TEMPLATE), filename="birthday-import-template.csv"),
         )
 
@@ -296,9 +292,7 @@ class ImportView(OwnedView):
 
     async def review(self, interaction):
         if not self.ready():
-            await private(
-                interaction, "Finish verification and fix every CSV error before importing."
-            )
+            await private(interaction, "Verification incomplete or CSV errors remain.")
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         self.reviewed = True
@@ -311,7 +305,7 @@ class ImportView(OwnedView):
         self.add_item(button("Back to preview", self.refresh))
         await edit(
             interaction,
-            content=f"**Confirm birthday import**\n{len(rows)} verified members: {len(rows) - pending} saved birthdays, {pending} pending timezone confirmation.\n**{enabled} birthdays will have public sharing, posts and DMs enabled.** All others stay private or pending.\nExisting records and annual anti-spam receipts are preserved. Departed members are skipped. No records have been written yet.",
+            content=f"**Confirm import**\nSave: {len(rows) - pending} · Pending timezone: {pending}\nPublic list + posts + DMs: {enabled} members\nExisting and departed members skipped.",
             view=self,
         )
 
@@ -319,7 +313,7 @@ class ImportView(OwnedView):
         if not await self.check_access(interaction):
             return
         if self.completed or not self.ready() or not self.reviewed:
-            await private(interaction, "This import was already completed or is not ready.")
+            await private(interaction, "Import completed or not ready.")
             return
         rows = [row for row in self.parsed.rows if self.statuses.get(row.user_id) == "member"]
         async with self.bot.mutation_lock:
@@ -338,6 +332,6 @@ class ImportView(OwnedView):
         )
         await edit(
             interaction,
-            content=f"✅ Import complete: **{saved} saved**, **{pending} awaiting timezone confirmation**, **{skipped} newly existing records skipped**. Other existing/departed records were excluded during verification.\nPending members can open Set or Update birthday to confirm their imported details.",
+            content=f"**Import complete**\nSaved: {saved} · Pending timezone: {pending} · Additional skips: {skipped}",
             view=navigation(self.bot, self.owner, self.guild_id, admin=True),
         )

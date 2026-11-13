@@ -145,7 +145,9 @@ async def test_save_is_private_uses_current_moderator_settings_and_keeps_optout(
     assert (record["hour"], record["minute"], record["leap"]) == (10, 30, "mar1")
     assert value.response.defer.call_args.kwargs["ephemeral"]
     assert value.edit_original_response.call_args.kwargs["view"] is None
-    assert "opted out" in str(value.edit_original_response.call_args.kwargs["embed"].to_dict())
+    assert "Posts: Off · DMs: Off" in str(
+        value.edit_original_response.call_args.kwargs["embed"].to_dict()
+    )
 
 
 def test_logs_redact_bot_token_and_authorization():

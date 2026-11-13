@@ -9,7 +9,7 @@ from discord import app_commands
 
 from .delivery import celebration, channel_issues
 from .directory import open_directory
-from .embeds import birthday_embed, manager_embed
+from .embeds import birthday_date, birthday_embed, manager_embed
 from .ui import (
     BirthdayWizard,
     Confirm,
@@ -67,15 +67,15 @@ class PrivateList(OwnedView):
             (self.guild_id, self.guild_id, self.page * 10),
         )
         lines = [
-            f"<@{r['user_id']}> · {r['month']:02}/{r['day']:02} · {r['timezone'] or 'NEEDS TIMEZONE'}{' (pending import)' if r['pending'] else ''} · "
-            f"{r['hour']:02}:{r['minute']:02} · {'public' if r['consent'] else 'private'} · {r['leap']}"
+            f"<@{r['user_id']}> · **{birthday_date(r['month'], r['day'])}** · {r['timezone'] or 'Timezone required'} · "
+            f"{r['hour']:02}:{r['minute']:02} · "
+            + ("Pending" if r["pending"] else "Sharing on" if r["consent"] else "Sharing off")
             for r in values
         ]
         return (
-            "**Birthday records · moderators only**\n"
-            + ("\n".join(lines) or "No records yet.")
-            + f"\nPage {self.page + 1}/{max(1, (total + 9) // 10)} · {total} records\n"
-            "Dates are MM/DD. Do not share private records."
+            "**Birthday records**\n"
+            + ("\n".join(lines) or "No records.")
+            + f"\nPage {self.page + 1}/{max(1, (total + 9) // 10)} · {total} records"
         )
 
     async def previous(self, interaction):
@@ -120,7 +120,7 @@ class DeliveryList(OwnedView):
         self.clear_items()
         if rows:
             select = discord.ui.Select(
-                placeholder="Review a delivery",
+                placeholder="Delivery",
                 row=0,
                 options=[
                     discord.SelectOption(
@@ -151,7 +151,7 @@ class DeliveryList(OwnedView):
         return (
             f"**{self.kind.title()} deliveries needing attention** · page {self.page + 1}\n"
             + ("\n".join(lines) or "None.")
-            + "\nChoose a delivery to review it."
+            + ""
         )
 
     async def refresh(self, interaction):
@@ -243,7 +243,7 @@ class DeliveryReview(OwnedView):
                 self.audit(interaction, current, "verified_sent")
                 await edit(
                     interaction,
-                    content="✅ Verified the bot's matching message and marked it delivered. Its 24-hour deletion is scheduled.",
+                    content="Delivery confirmed. Deletion scheduled after 24 hours.",
                     view=navigation(self.bot, self.owner, self.guild_id, admin=True),
                 )
                 return
@@ -253,9 +253,9 @@ class DeliveryReview(OwnedView):
             interaction,
             content=await self.render()
             + (
-                "\nNo match in this batch of 500. Search older messages to continue."
+                "\nNo match in this batch of 500."
                 if self.before
-                else "\nNo matching message found in the remaining history. A missing match alone does not prove the send failed."
+                else "\nNo match in remaining history."
             ),
             view=self,
         )
@@ -295,7 +295,7 @@ class DeliveryReview(OwnedView):
                 if self.kind == "dm"
                 else f"Original channel: <#{job['channel_id']}>\n"
             )
-            + "Check for this marker before retrying. Retry can duplicate an existing greeting; it only sends during the member's local birthday while sharing and announcements are enabled. Skip leaves any existing message untouched.",
+            + "Check the marker before retrying. Retry may duplicate an existing message.",
             view,
         )
 
@@ -313,7 +313,7 @@ class DeliveryReview(OwnedView):
         self.audit(interaction, job, state)
         await edit(
             interaction,
-            content=f"✅ Delivery decision saved: {state}.",
+            content=f"Delivery: {state}.",
             view=navigation(self.bot, self.owner, self.guild_id, admin=True),
         )
 
@@ -380,30 +380,11 @@ def install(bot):
             )
             card.title = "Birthday manager"
         else:
-            card = manager_embed(
-                "🎂 Birthday manager",
-                "Browse server birthdays or save your own month, day and timezone.",
-            )
-            card.add_field(
-                name="Your birthday",
-                value="Choose **Set birthday** to get started, or **Update birthday** to change your details.",
-                inline=False,
-            )
-            card.add_field(
-                name="Server birthdays",
-                value="Open **View birthdays** for the calendar or **Monthly summary** for totals.",
-                inline=False,
-            )
-        if moderator(interaction):
-            card.add_field(
-                name="Moderation",
-                value="**Server tools** opens settings, records and CSV import.",
-                inline=False,
-            )
+            card = manager_embed("Birthday manager", "Birthday not set.")
         await show(
             bot,
             interaction,
-            "**🎂 Birthday bot**\nBrowse the server calendar or manage your own birthday.",
+            "**Birthday manager**",
             view,
             embed=card,
         )
@@ -417,14 +398,12 @@ def install(bot):
             else None
         )
         if update and not record and not pending:
-            await result(
-                interaction, "You haven't set a birthday yet. Choose Set birthday in the main menu."
-            )
+            await result(interaction, "No birthday set.")
             return
         if not update and record:
             await result(
                 interaction,
-                "Your birthday is already saved. Choose Update birthday in the main menu.",
+                "Already set. Use Update birthday.",
             )
             return
         view = BirthdayWizard(
@@ -455,7 +434,7 @@ def install(bot):
                 return
             await result(
                 interaction,
-                "You have no birthday saved here. Choose Set birthday in the main menu.",
+                "No birthday set.",
             )
             return
         await result(
@@ -491,7 +470,7 @@ def install(bot):
         await show(
             bot,
             interaction,
-            f"Delete the stored birthday for <@{member_id}> in this server? Existing messages and operator backups follow their normal retention.",
+            f"Delete birthday for <@{member_id}>?",
             view,
         )
 
@@ -519,7 +498,7 @@ def install(bot):
         await show(
             bot,
             interaction,
-            "**Server tools**\nManage Server permission is required for every action.",
+            "**Server tools**",
             view,
         )
 
@@ -530,13 +509,13 @@ def install(bot):
         if interaction.guild_id in bot.import_sessions:
             await private(
                 interaction,
-                "An import is already open for this server. Finish or cancel it first, or wait for its menu to expire.",
+                "An import is already open for this server.",
             )
             return
         if len(bot.import_sessions) >= 3:
             await private(
                 interaction,
-                "The import slots are busy. Please try again after another import finishes.",
+                "Import slots busy. Try again shortly.",
             )
             return
         view = ImportView(bot, interaction.user.id, interaction.guild_id)
@@ -556,9 +535,7 @@ def install(bot):
     @action("forget", admin=True)
     async def forget(interaction):
         view = OwnedView(interaction.user.id, admin=True, queue=bot.queue)
-        members = discord.ui.UserSelect(
-            placeholder="Choose the member whose birthday to delete", row=0
-        )
+        members = discord.ui.UserSelect(placeholder="Member", row=0)
 
         async def choose(submission):
             require_mod(submission)
@@ -570,7 +547,7 @@ def install(bot):
         await show(
             bot,
             interaction,
-            "**Delete a member's birthday**\nChoose a member, then confirm deletion.",
+            "**Delete member birthday**",
             view,
         )
 
@@ -586,9 +563,7 @@ def install(bot):
                 await bot.db.pause(submission.guild_id, paused)
             await result(
                 submission,
-                "Announcements and birthday DMs paused."
-                if paused
-                else "Announcements and birthday DMs resumed. Today's due birthdays may catch up.",
+                "Posts and DMs paused." if paused else "Posts and DMs resumed.",
                 admin=True,
             )
             log.info(
@@ -610,7 +585,7 @@ def install(bot):
         await show(
             bot,
             interaction,
-            f"Announcements and birthday DMs are **{'enabled' if settings['enabled'] else 'paused'}**.",
+            f"Posts and DMs: **{'On' if settings['enabled'] else 'Paused'}**",
             view,
         )
 

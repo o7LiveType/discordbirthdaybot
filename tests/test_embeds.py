@@ -35,7 +35,7 @@ def test_birthday_embed_matches_reference_fields_and_uses_precise_discord_countd
     stamp = int(next_occurrence(record(), now).timestamp())
     assert fields["Countdown"].value == f"<t:{stamp}:R> (<t:{stamp}:F>)"
     assert not fields["Countdown"].inline
-    assert "mentioned" in fields["Birthday sharing"].value
+    assert fields["Sharing"].value == "Public list: On\nPosts: On · DMs: On"
     assert len(card) <= 6000
 
 
@@ -44,16 +44,21 @@ def test_card_respects_optout_pause_and_pending_timezone_without_a_guessed_count
         user(), record(consent=False), settings={"enabled": False, "channel_id": None}
     )
     fields = {field.name: field.value for field in card.fields}
-    assert "opted out" in fields["Birthday sharing"] and "paused" in fields["Birthday sharing"]
+    assert fields["Sharing"] == "Public list: Off\nPosts: Off · DMs: Off"
+    paused = birthday_embed(user(), record(), settings={"enabled": False, "channel_id": None})
+    assert (
+        "Posts: Paused · DMs: Paused"
+        in {field.name: field.value for field in paused.fields}["Sharing"]
+    )
     pending = birthday_embed(user(), record(timezone=None), draft=True, zone_valid=False)
     fields = {field.name: field.value for field in pending.fields}
-    assert fields["Time Zone"] == "Choose a timezone below"
-    assert "<t:" not in fields["Countdown"]
+    assert fields["Time Zone"] == "Required"
+    assert "Countdown" not in fields
 
 
 def test_today_card_and_leap_day_card_follow_scheduler_calendar_rules():
     today = birthday_embed(user(), record(), now=datetime(2026, 12, 27, 12, tzinfo=UTC))
-    assert today.fields[2].value.startswith("🎉 Today")
+    assert today.fields[2].value.startswith("Today")
     leap = record(month=2, day=29, leap="mar1", timezone="America/New_York")
     now = datetime(2027, 2, 1, tzinfo=UTC)
     stamp = int(datetime(2027, 3, 1, 5, tzinfo=UTC).timestamp())

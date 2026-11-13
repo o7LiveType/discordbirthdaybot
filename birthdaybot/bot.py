@@ -43,12 +43,12 @@ class PrivateTree(app_commands.CommandTree):
     async def on_error(self, interaction, error):
         original = getattr(error, "original", error)
         if isinstance(error, app_commands.MissingPermissions):
-            message = "You need Manage Server permission for that command."
+            message = "Manage Server required."
             log.warning(
                 "permission_denied guild=%s user=%s", interaction.guild_id, interaction.user.id
             )
         elif isinstance(error, app_commands.CommandNotFound):
-            message = "That is an old command cached by Discord. Reopen the command picker and use /birthdaybot."
+            message = "Command outdated. Use /birthdaybot."
             log.warning(
                 "stale_command guild=%s name=%s",
                 interaction.guild_id,
@@ -65,7 +65,7 @@ class PrivateTree(app_commands.CommandTree):
                 type(original).__name__,
                 "".join(traceback.format_tb(original.__traceback__)),
             )
-            message = "That command failed. Please try again. A moderator can check the logs."
+            message = "Command failed. Try again."
         await private(interaction, message)
 
 

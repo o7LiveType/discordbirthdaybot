@@ -223,7 +223,7 @@ async def test_public_calendar_queued_controls_work_for_a_different_member(db):
         assert view.summary
         assert (
             interaction.edit_original_response.call_args.kwargs["embed"].title
-            == "📅 Birthdays by month"
+            == "Birthdays by month"
         )
     finally:
         await bot.queue.close()

@@ -45,7 +45,7 @@ class WorkQueue:
             or self.jobs.full()
             or self.guild_pending[key[0]] >= 8
         ):
-            text = "I'm busy with your last action or the queue is full. Please wait a moment and try again."
+            text = "Action pending or queue full. Try again shortly."
             if interaction.response.is_done():
                 await interaction.followup.send(text, ephemeral=True)
             else:
@@ -72,7 +72,7 @@ class WorkQueue:
             return await future
         except TimeoutError:
             await interaction.followup.send(
-                "That action timed out. Open /birthdaybot → My birthday before retrying a save.",
+                "Timed out. Check My birthday before retrying.",
                 ephemeral=True,
             )
 
