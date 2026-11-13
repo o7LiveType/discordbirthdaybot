@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import discord
 
+from .sharing import Sharing
 from .timeutil import due, next_occurrence, timezone_label
 
 ACCENT = 0xDE5DBC
@@ -87,16 +88,20 @@ def birthday_embed(
             else True
         )
     )
-    posts = dms = "On" if record["consent"] else "Off"
-    if record["consent"] and settings is not None:
+    flags = Sharing.from_record(record)
+    posts = "On" if flags.announce else "Off"
+    dms = "On" if flags.dm_enabled else "Off"
+    if settings is not None:
         if not settings["enabled"]:
-            posts = dms = "Paused"
-        elif not settings["channel_id"]:
+            posts = "Paused" if flags.announce else "Off"
+            dms = "Paused" if flags.dm_enabled else "Off"
+        elif flags.announce and not settings["channel_id"]:
             posts = "No channel"
-    visibility = "On" if record["consent"] and public else "Off"
+    mentions = "On" if flags.mention_enabled and posts == "On" else "Off"
+    visibility = "On" if flags.list_public and public else "Off"
     embed.add_field(
         name="Sharing",
-        value=f"Public list: {visibility}\nPosts: {posts} · DMs: {dms}",
+        value=f"Public list: {visibility}\nPosts: {posts} · Mentions: {mentions}\nDMs: {dms}",
         inline=False,
     )
     embed.set_footer(

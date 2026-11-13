@@ -1,6 +1,7 @@
 import calendar
 import logging
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,7 @@ import discord
 from .config import DEFAULT_GIF, gif_url
 from .delivery import channel_issues
 from .embeds import birthday_embed, manager_embed, text_embed
+from .sharing import FLAGS, LABELS, Sharing
 from .timeutil import anniversary, format_offset, timezone, timezone_label
 from .timezone_catalog import REGIONS, catalog, search_timezones
 
@@ -225,6 +227,83 @@ def navigation(bot, owner, guild_id, *, admin=False):
     if admin:
         view.add_item(button("Server tools", bot.menu_actions["tools"]))
     return bot.track_view(view, guild_id, owner)
+
+
+class SharingEditor:
+    def __init__(self, view, flags, save, cancel, *, save_label="Save"):
+        self.view, self.flags, self.save, self.cancel = view, flags, save, cancel
+        self.save_label = save_label
+
+    def build(self):
+        self.view.clear_items()
+        for index, (key, label) in enumerate(zip(FLAGS, LABELS, strict=True)):
+
+            def callback_for(permission):
+                async def toggle(interaction):
+                    self.flags = replace(
+                        self.flags, **{permission: not getattr(self.flags, permission)}
+                    )
+                    self.build()
+                    await edit(interaction, content="**Sharing**", view=self.view)
+
+                return toggle
+
+            enabled = getattr(self.flags, key)
+            self.view.add_item(
+                button(
+                    f"{label}: {'On' if enabled else 'Off'}",
+                    callback_for(key),
+                    row=index // 2,
+                    style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary,
+                )
+            )
+        self.view.add_item(
+            button(self.save_label, self.save, row=2, style=discord.ButtonStyle.primary)
+        )
+        self.view.add_item(button("Cancel", self.cancel, row=2))
+
+
+class SharingView(OwnedView):
+    def __init__(self, bot, owner, guild_id, record):
+        super().__init__(owner, queue=bot.queue)
+        self.bot, self.guild_id = bot, guild_id
+        self.pending = record["timezone"] is None
+        self.editor = SharingEditor(self, Sharing.from_record(record), self.save, self.cancel)
+        self.editor.build()
+
+    def content(self):
+        return "**Sharing**"
+
+    def make_embed(self, interaction):
+        return manager_embed("Sharing", "Pending timezone" if self.pending else None)
+
+    async def save(self, interaction):
+        if not await self.check_access(interaction):
+            return
+        async with self.bot.mutation_lock:
+            await self.bot.db.set_sharing(self.guild_id, self.owner, self.editor.flags)
+        log.info(
+            "sharing_saved guild=%s user=%s list=%s posts=%s dms=%s mentions=%s",
+            self.guild_id,
+            self.owner,
+            *self.editor.flags.values(),
+        )
+        embed = manager_embed("Sharing saved")
+        for label, enabled in zip(LABELS, self.editor.flags.values(), strict=True):
+            embed.add_field(name=label, value="On" if enabled else "Off", inline=True)
+        self.stop()
+        await edit(
+            interaction,
+            content=None,
+            embed=embed,
+            view=navigation(self.bot, self.owner, self.guild_id),
+        )
+
+    async def cancel(self, interaction):
+        self.stop()
+        await edit(
+            interaction, content="Cancelled.", view=navigation(self.bot, self.owner, self.guild_id)
+        )
 
 
 class TimezoneBrowser:
@@ -449,9 +528,10 @@ class BirthdayWizard(OwnedView):
         self.month = record["month"] if record else None
         self.day = record["day"] if record else None
         self.zone = zone or (record["timezone"] if record else None) or settings["timezone"]
-        self.opt_out = (
-            opt_out if opt_out is not None else (not record["consent"] if record else False)
-        )
+        self.sharing = Sharing.from_record(record) if record is not None else Sharing.all(True)
+        if opt_out is not None:
+            self.opt_out = opt_out
+        self.editing_sharing = False
         self.day_page = int(bool(self.day and self.day >= 25))
         self.completed = False
         self.public_birthdays = bool(settings["public_birthdays"])
@@ -462,7 +542,17 @@ class BirthdayWizard(OwnedView):
         self.zone_notice = ""
         self.build()
 
+    @property
+    def opt_out(self):
+        return not self.sharing.enabled
+
+    @opt_out.setter
+    def opt_out(self, value):
+        self.sharing = Sharing.all(not value)
+
     def content(self):
+        if self.editing_sharing:
+            return "**Sharing**"
         if self.browsing_zone:
             return self.zone_browser.content()
         month = calendar.month_name[self.month] if self.month else "—"
@@ -477,6 +567,8 @@ class BirthdayWizard(OwnedView):
         return "\n".join(lines)
 
     def make_embed(self, interaction):
+        if self.editing_sharing:
+            return manager_embed("Sharing")
         if self.browsing_zone:
             return text_embed(self.zone_browser.content())
         record = dict(
@@ -486,7 +578,8 @@ class BirthdayWizard(OwnedView):
             hour=self.hour,
             minute=self.minute,
             leap=self.leap,
-            consent=not self.opt_out,
+            consent=self.sharing.enabled,
+            **self.sharing.record_values(),
         )
         return birthday_embed(
             interaction.user,
@@ -499,6 +592,9 @@ class BirthdayWizard(OwnedView):
 
     def build(self):
         self.clear_items()
+        if self.editing_sharing:
+            self.sharing_editor.build()
+            return
         if self.browsing_zone:
             self.zone_browser.build()
             return
@@ -606,7 +702,7 @@ class BirthdayWizard(OwnedView):
                 disabled=not (self.month and self.day and self.zone_valid),
             )
         )
-        self.add_item(button("Sharing: " + ("OFF" if self.opt_out else "ON"), self.toggle, row=3))
+        self.add_item(button("Sharing", self.open_sharing, row=3))
         self.add_item(button("Cancel", self.cancel, row=3))
 
         self.add_item(button("Browse all timezones", self.browse_zones))
@@ -637,8 +733,20 @@ class BirthdayWizard(OwnedView):
         self.browsing_zone = True
         await self.zone_browser.search(interaction, query)
 
-    async def toggle(self, interaction):
-        self.opt_out = not self.opt_out
+    async def open_sharing(self, interaction):
+        self.editing_sharing = True
+        self.sharing_editor = SharingEditor(
+            self, self.sharing, self.apply_sharing, self.cancel_sharing, save_label="Apply"
+        )
+        self.build()
+        await edit(interaction, content=self.content(), view=self)
+
+    async def apply_sharing(self, interaction):
+        self.sharing = self.sharing_editor.flags
+        await self.cancel_sharing(interaction)
+
+    async def cancel_sharing(self, interaction):
+        self.editing_sharing = False
         self.build()
         await edit(interaction, content=self.content(), view=self)
 
@@ -672,7 +780,8 @@ class BirthdayWizard(OwnedView):
                 settings["hour"],
                 settings["minute"],
                 settings["leap"],
-                not self.opt_out,
+                self.sharing.enabled,
+                sharing=self.sharing,
             )
         self.completed = True
         self.stop()
@@ -683,7 +792,8 @@ class BirthdayWizard(OwnedView):
             hour=settings["hour"],
             minute=settings["minute"],
             leap=settings["leap"],
-            consent=not self.opt_out,
+            consent=self.sharing.enabled,
+            **self.sharing.record_values(),
         )
         await edit(
             interaction,

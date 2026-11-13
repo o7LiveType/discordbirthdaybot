@@ -8,6 +8,8 @@ from uuid import uuid4
 
 import aiosqlite
 
+from .sharing import FLAGS, Sharing
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guilds (
  guild_id INTEGER PRIMARY KEY, channel_id INTEGER, alert_channel_id INTEGER,
@@ -24,6 +26,10 @@ CREATE TABLE IF NOT EXISTS birthdays (
  hour INTEGER NOT NULL CHECK(hour BETWEEN 0 AND 23), minute INTEGER NOT NULL CHECK(minute BETWEEN 0 AND 59),
  leap TEXT NOT NULL CHECK(leap IN ('feb28','mar1','leap_only')),
  consent INTEGER NOT NULL CHECK(consent IN (0,1)), updated_at REAL NOT NULL,
+ list_public INTEGER NOT NULL DEFAULT 0 CHECK(list_public IN (0,1)),
+ announce INTEGER NOT NULL DEFAULT 0 CHECK(announce IN (0,1)),
+ dm_enabled INTEGER NOT NULL DEFAULT 0 CHECK(dm_enabled IN (0,1)),
+ mention_enabled INTEGER NOT NULL DEFAULT 0 CHECK(mention_enabled IN (0,1)),
  PRIMARY KEY(guild_id,user_id)
 );
 CREATE TABLE IF NOT EXISTS birthday_import_pending (
@@ -31,7 +37,12 @@ CREATE TABLE IF NOT EXISTS birthday_import_pending (
  user_id INTEGER NOT NULL, month INTEGER NOT NULL CHECK(month BETWEEN 1 AND 12),
  day INTEGER NOT NULL CHECK(day BETWEEN 1 AND 31), timezone TEXT,
  consent INTEGER NOT NULL CHECK(consent IN (0,1)), imported_at REAL NOT NULL,
- imported_by INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)
+ imported_by INTEGER NOT NULL,
+ list_public INTEGER NOT NULL DEFAULT 0 CHECK(list_public IN (0,1)),
+ announce INTEGER NOT NULL DEFAULT 0 CHECK(announce IN (0,1)),
+ dm_enabled INTEGER NOT NULL DEFAULT 0 CHECK(dm_enabled IN (0,1)),
+ mention_enabled INTEGER NOT NULL DEFAULT 0 CHECK(mention_enabled IN (0,1)),
+ PRIMARY KEY(guild_id,user_id)
 );
 CREATE INDEX IF NOT EXISTS birthday_import_pending_date ON birthday_import_pending(guild_id,month,day,user_id);
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -73,11 +84,12 @@ CREATE TABLE IF NOT EXISTS directory_messages (
  PRIMARY KEY(guild_id,channel_id)
 );
 INSERT OR IGNORE INTO receipts SELECT guild_id,user_id,year FROM deliveries WHERE state='sent';
-CREATE INDEX IF NOT EXISTS birthdays_active_date ON birthdays(month,day,guild_id) WHERE consent=1;
+CREATE INDEX IF NOT EXISTS birthdays_announce_date ON birthdays(month,day,guild_id) WHERE announce=1;
+CREATE INDEX IF NOT EXISTS birthdays_dm_date ON birthdays(month,day,guild_id) WHERE dm_enabled=1;
 CREATE INDEX IF NOT EXISTS birthdays_guild_date ON birthdays(guild_id,month,day,user_id);
-CREATE INDEX IF NOT EXISTS birthdays_public_guild_date ON birthdays(guild_id,month,day,user_id) WHERE consent=1;
+CREATE INDEX IF NOT EXISTS birthdays_visible_guild_date ON birthdays(guild_id,month,day,user_id) WHERE list_public=1;
 CREATE INDEX IF NOT EXISTS deliveries_recovery ON deliveries(retry_at) WHERE state IN ('sending','uncertain');
-PRAGMA user_version=8;
+PRAGMA user_version=9;
 """
 
 
@@ -100,7 +112,7 @@ class Database:
             if result[0].lower() != "wal" or mode[0] != 2:
                 raise RuntimeError("SQLite did not enable WAL with synchronous=FULL.")
             version = (await (await self.conn.execute("PRAGMA user_version")).fetchone())[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+            if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
                 raise RuntimeError("Database schema is newer than this bot; refusing to downgrade.")
             migration = (
                 "ALTER TABLE guilds ADD COLUMN leap TEXT NOT NULL DEFAULT 'feb28' CHECK(leap IN ('feb28','mar1','leap_only'));\n"
@@ -134,6 +146,19 @@ class Database:
                 )
             if version in (1, 2, 3, 4, 5, 6):
                 migration += "UPDATE guilds SET timezone='UTC' WHERE timezone='America/New_York';"
+            for table in ("birthdays", "birthday_import_pending"):
+                columns = {
+                    row[1]
+                    for row in await (
+                        await self.conn.execute(f"PRAGMA table_info({table})")
+                    ).fetchall()
+                }  # noqa: S608 - fixed table choices
+                if columns:
+                    for key in FLAGS:
+                        if key not in columns:
+                            migration += f"ALTER TABLE {table} ADD COLUMN {key} INTEGER NOT NULL DEFAULT 0 CHECK({key} IN (0,1)); UPDATE {table} SET {key}=consent;"  # noqa: S608 - fixed table and flag names
+            if version < 9:
+                migration += "DROP INDEX IF EXISTS birthdays_active_date; DROP INDEX IF EXISTS birthdays_public_guild_date;"
             await self.conn.executescript("BEGIN IMMEDIATE;\n" + migration + SCHEMA + "\nCOMMIT;")
             self.path.chmod(0o600)
         except BaseException:
@@ -283,34 +308,55 @@ class Database:
                             settings["leap"],
                             consent,
                             now,
+                            *Sharing.all(consent).values(),
                         )
                     )
                 else:
                     pending.append(
-                        (guild_id, row.user_id, row.month, row.day, None, consent, now, actor)
+                        (
+                            guild_id,
+                            row.user_id,
+                            row.month,
+                            row.day,
+                            None,
+                            consent,
+                            now,
+                            actor,
+                            *Sharing.all(consent).values(),
+                        )
                     )
-            await conn.executemany("INSERT INTO birthdays VALUES (?,?,?,?,?,?,?,?,?,?)", complete)
             await conn.executemany(
-                "INSERT INTO birthday_import_pending VALUES (?,?,?,?,?,?,?,?)", pending
+                "INSERT INTO birthdays(guild_id,user_id,month,day,timezone,hour,minute,leap,consent,updated_at,list_public,announce,dm_enabled,mention_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                complete,
+            )
+            await conn.executemany(
+                "INSERT INTO birthday_import_pending(guild_id,user_id,month,day,timezone,consent,imported_at,imported_by,list_public,announce,dm_enabled,mention_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                pending,
             )
             if complete:
                 await self._invalidate_directories(conn, guild_id)
         return len(complete), len(pending), len(existing)
 
-    async def save(self, guild_id, user_id, month, day, zone, hour, minute, leap, consent):
+    async def save(
+        self, guild_id, user_id, month, day, zone, hour, minute, leap, consent, *, sharing=None
+    ):
         from datetime import time
 
         from .timeutil import anniversary, timezone
 
+        sharing = Sharing.all(consent) if sharing is None else sharing
+        if not isinstance(sharing, Sharing):
+            raise ValueError("Invalid sharing permissions.")
         anniversary(month, day, 2000, leap)
         zone = timezone(zone)
         time(hour, minute)
         async with self.transaction() as conn:
             await conn.execute(
-                """INSERT INTO birthdays VALUES (?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO birthdays(guild_id,user_id,month,day,timezone,hour,minute,leap,consent,updated_at,list_public,announce,dm_enabled,mention_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(guild_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,
                 timezone=excluded.timezone,hour=excluded.hour,minute=excluded.minute,
-                leap=excluded.leap,consent=excluded.consent,updated_at=excluded.updated_at""",
+                leap=excluded.leap,consent=excluded.consent,updated_at=excluded.updated_at,
+                list_public=excluded.list_public,announce=excluded.announce,dm_enabled=excluded.dm_enabled,mention_enabled=excluded.mention_enabled""",
                 (
                     guild_id,
                     user_id,
@@ -320,8 +366,9 @@ class Database:
                     hour,
                     minute,
                     leap,
-                    consent,
+                    sharing.enabled,
                     datetime.now(UTC).timestamp(),
+                    *sharing.values(),
                 ),
             )
             await self._invalidate_directories(conn, guild_id)
@@ -336,11 +383,53 @@ class Database:
                 (guild_id, user_id),
             )
 
+    async def set_sharing(self, guild_id, user_id, sharing):
+        if not isinstance(sharing, Sharing):
+            raise ValueError("Invalid sharing permissions.")
+        async with self.transaction() as conn:
+            record = await (
+                await conn.execute(
+                    "SELECT list_public,dm_enabled FROM birthdays WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id),
+                )
+            ).fetchone()
+            pending = (
+                await (
+                    await conn.execute(
+                        "SELECT user_id,dm_enabled FROM birthday_import_pending WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id),
+                    )
+                ).fetchone()
+                if record is None
+                else None
+            )
+            if record is None and pending is None:
+                raise ValueError("Birthday deleted. Use Set birthday.")
+            table = "birthdays" if record is not None else "birthday_import_pending"
+            timestamp = ",updated_at=?" if record is not None else ""
+            await conn.execute(
+                f"UPDATE {table} SET consent=?,list_public=?,announce=?,dm_enabled=?,mention_enabled=?{timestamp} WHERE guild_id=? AND user_id=?",  # noqa: S608 - fixed table and column choices
+                (
+                    sharing.enabled,
+                    *sharing.values(),
+                    *((datetime.now(UTC).timestamp(),) if record is not None else ()),
+                    guild_id,
+                    user_id,
+                ),
+            )
+            if record is not None and bool(record[0]) != sharing.list_public:
+                await self._invalidate_directories(conn, guild_id)
+            if bool((record if record is not None else pending)[1]) != sharing.dm_enabled:
+                await conn.execute(
+                    "DELETE FROM dm_deliveries WHERE guild_id=? AND user_id=? AND state IN ('ready','retry','skipped')",
+                    (guild_id, user_id),
+                )
+
     async def directory(self, guild_id, *, public_only=True, month=None, page=0):
         """Return one indexed calendar page and aggregate counts in one snapshot."""
         if month is not None and month not in range(1, 13):
             raise ValueError("Choose a month from January through December.")
-        public_clause = " AND consent=1" if public_only else ""
+        public_clause = " AND list_public=1" if public_only else ""
         month_clause = " AND month=?" if month is not None else ""
         async with self.transaction(write=False) as conn:
             configured = (
@@ -415,8 +504,9 @@ class Database:
         terms = " OR ".join("(b.month=? AND b.day=?)" for _ in pairs)
         parameters = [value for pair in sorted(pairs) for value in pair]
         receipt_table = "dm_deliveries" if dm else "receipts"
+        permission = "dm_enabled" if dm else "announce"
         query = f"""SELECT b.* FROM birthdays b JOIN guilds g ON g.guild_id=b.guild_id
-          WHERE b.consent=1 AND g.enabled=1 AND ({terms})
+          WHERE b.{permission}=1 AND g.enabled=1 AND ({terms})
           AND NOT EXISTS (SELECT 1 FROM {receipt_table} d WHERE d.guild_id=b.guild_id AND d.user_id=b.user_id
           AND d.year=CASE WHEN b.month=1 AND ?=12 THEN ?+1
                           WHEN b.month=12 AND ?=1 THEN ?-1 ELSE ? END

@@ -15,6 +15,7 @@ from .ui import (
     Confirm,
     OwnedView,
     SettingsWizard,
+    SharingView,
     button,
     defer,
     edit,
@@ -63,13 +64,17 @@ class PrivateList(OwnedView):
         )[0][0]
         self.page = max(0, min(self.page, (total - 1) // 10))
         values = await self.bot.db.read(
-            "SELECT user_id,month,day,timezone,hour,minute,consent,leap,0 AS pending FROM birthdays WHERE guild_id=? UNION ALL SELECT p.user_id,p.month,p.day,p.timezone,g.hour,g.minute,p.consent,g.leap,1 FROM birthday_import_pending p JOIN guilds g ON g.guild_id=p.guild_id WHERE p.guild_id=? ORDER BY month,day,user_id LIMIT 10 OFFSET ?",
+            "SELECT user_id,month,day,timezone,hour,minute,consent,leap,list_public,announce,dm_enabled,mention_enabled,0 AS pending FROM birthdays WHERE guild_id=? UNION ALL SELECT p.user_id,p.month,p.day,p.timezone,g.hour,g.minute,p.consent,g.leap,p.list_public,p.announce,p.dm_enabled,p.mention_enabled,1 FROM birthday_import_pending p JOIN guilds g ON g.guild_id=p.guild_id WHERE p.guild_id=? ORDER BY month,day,user_id LIMIT 10 OFFSET ?",
             (self.guild_id, self.guild_id, self.page * 10),
         )
         lines = [
             f"<@{r['user_id']}> · **{birthday_date(r['month'], r['day'])}** · {r['timezone'] or 'Timezone required'} · "
             f"{r['hour']:02}:{r['minute']:02} · "
-            + ("Pending" if r["pending"] else "Sharing on" if r["consent"] else "Sharing off")
+            + (
+                "Pending"
+                if r["pending"]
+                else f"List {'On' if r['list_public'] else 'Off'} · Posts {'On' if r['announce'] else 'Off'} · DMs {'On' if r['dm_enabled'] else 'Off'} · Mentions {'On' if r['mention_enabled'] else 'Off'}"
+            )
             for r in values
         ]
         return (
@@ -368,6 +373,7 @@ def install(bot):
             ("Update birthday", "update", 1),
             ("My birthday", "me", 1),
             ("Delete birthday", "delete", 2),
+            ("Sharing", "sharing", 2),
         ]
         if moderator(interaction):
             actions.append(("Server tools", "tools", 2))
@@ -424,6 +430,20 @@ def install(bot):
     @action("update")
     async def update_birthday(interaction):
         await open_member(interaction, update=True)
+
+    @action("sharing")
+    async def sharing(interaction):
+        record = await bot.db.birthday(interaction.guild_id, interaction.user.id)
+        record = (
+            record
+            if record is not None
+            else await bot.db.pending_birthday(interaction.guild_id, interaction.user.id)
+        )
+        if record is None:
+            await result(interaction, "No birthday set.")
+            return
+        view = SharingView(bot, interaction.user.id, interaction.guild_id, record)
+        await show(bot, interaction, view.content(), view)
 
     @action("me")
     async def me(interaction):

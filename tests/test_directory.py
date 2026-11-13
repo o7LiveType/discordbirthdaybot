@@ -162,6 +162,7 @@ async def test_main_menu_navigation_does_not_requeue_itself(db):
         "Update birthday",
         "My birthday",
         "Delete birthday",
+        "Sharing",
     }
     bot.queue.start()
     try:

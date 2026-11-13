@@ -23,13 +23,18 @@ def channel_issues(channel, guild):
     ]
 
 
-def celebration(user_id, gif, marker, *, preview=False):
+def celebration(user_id, gif, marker, *, preview=False, name=None):
+    recipient = (
+        f"<@{user_id}>"
+        if name is None
+        else discord.utils.escape_markdown(discord.utils.escape_mentions(name))
+    )
     embed = discord.Embed(
         title="🎉 Happy Birthday! 🎂",
         color=0xF6B5D7,
         description=(
             "A little cake, a lot of joy, and a whole server cheering you on.\n\n"
-            f"Happy birthday, <@{user_id}>! Have a wonderful day! ✨"
+            f"Happy birthday, {recipient}! Have a wonderful day! ✨"
         ),
     )
     if gif:
@@ -114,7 +119,7 @@ class Scheduler:
             async with self.bot.mutation_lock:
                 record = await self.db.birthday(guild.id, snapshot["user_id"])
                 fresh_settings = await self.db.guild(guild.id)
-                if not record or not record["consent"] or not fresh_settings["enabled"]:
+                if not record or not record["announce"] or not fresh_settings["enabled"]:
                     continue
                 target = due(record, datetime.now(UTC) if self.bot.live_clock else now)
                 if target is None:
@@ -195,12 +200,28 @@ class Scheduler:
         # Commit intent BEFORE the external side effect. A crash leaves a reconcilable job.
         await self.db.delivery_state(job, "sending", channel_id=channel.id)
         job = dict(job) | {"channel_id": channel.id}
+        ping = bool(record["mention_enabled"])
+        name = getattr(member, "display_name", None)
+        name = name if isinstance(name, str) else f"Member {member.id}"
+        recipient = (
+            member.mention
+            if ping
+            else discord.utils.escape_markdown(discord.utils.escape_mentions(name))
+        )
         try:
             message = await channel.send(
-                content=f"🎂 {member.mention}",
-                embed=celebration(member.id, settings["gif"] or self.bot.config.gif, job["marker"]),
+                content=f"🎂 {recipient}",
+                embed=celebration(
+                    member.id,
+                    settings["gif"] or self.bot.config.gif,
+                    job["marker"],
+                    name=None if ping else name,
+                ),
                 allowed_mentions=discord.AllowedMentions(
-                    users=[member], roles=False, everyone=False, replied_user=False
+                    users=[member] if ping else False,
+                    roles=False,
+                    everyone=False,
+                    replied_user=False,
                 ),
                 nonce=job["marker"],
             )

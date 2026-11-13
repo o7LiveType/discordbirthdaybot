@@ -186,7 +186,7 @@ async def test_schema7_upgrade_creates_pending_table_without_changing_birthdays(
         await conn.execute("PRAGMA user_version=7")
     await db.close()
     await db.open()
-    assert (await db.read("PRAGMA user_version"))[0][0] == 8
+    assert (await db.read("PRAGMA user_version"))[0][0] == 9
     record = await db.birthday(1, A)
     assert (
         record["month"],

@@ -74,14 +74,20 @@ async def test_member_set_optout_update_and_delete_entirely_by_menu(menu):
     await choose(view, value, 0, "2")
     await choose(view, value, 1, "page")
     await choose(view, value, 1, "29")
-    await click(bot, value, "Sharing: ON")
+    await click(bot, value, "Sharing")
+    for label in ("Public list", "Server posts", "Birthday DMs", "Post mentions"):
+        await click(bot, value, label + ": On")
+    await click(bot, value, "Apply")
     await click(bot, value, "Save")
     assert (await bot.db.birthday(1, 20))["consent"] == 0
-    assert "Posts: Off · DMs: Off" in response_text(value)
+    assert "Posts: Off · Mentions: Off" in response_text(value)
     await click(bot, value, "Main menu")
     await click(bot, value, "Update birthday")
     assert bot.active_views[(1, 20)].opt_out
-    await click(bot, value, "Sharing: OFF")
+    await click(bot, value, "Sharing")
+    for label in ("Public list", "Server posts", "Birthday DMs", "Post mentions"):
+        await click(bot, value, label + ": Off")
+    await click(bot, value, "Apply")
     await click(bot, value, "Save")
     assert (await bot.db.birthday(1, 20))["consent"] == 1
     await click(bot, value, "Main menu")
@@ -391,7 +397,7 @@ async def test_private_actions_reject_a_different_guild_even_for_same_owner(menu
     value.guild_id = 2
     assert not await view.interaction_check(value)
     await next(
-        item for item in view.children if getattr(item, "label", None) == "Sharing: ON"
+        item for item in view.children if getattr(item, "label", None) == "Sharing"
     ).callback(value)
     assert not view.opt_out
 
@@ -790,3 +796,113 @@ async def test_csv_member_lookups_are_bounded_across_servers(menu):
     release.set()
     await asyncio.gather(*(view.job for view in views))
     assert peak == 2 and all(view.ready() for view in views)
+
+
+async def test_standalone_sharing_menu_saves_only_permissions_and_cancel_discards(menu):
+    from birthdaybot.sharing import Sharing
+    from birthdaybot.ui import SharingView
+
+    bot, value = menu
+    await bot.db.save(1, 20, 12, 27, "Europe/London", 18, 45, "mar1", True)
+    await bot.menu_actions["home"](value)
+    await click(bot, value, "Sharing")
+    view = bot.active_views[(1, 20)]
+    assert isinstance(view, SharingView)
+    assert len(view.to_components()) == 3
+    await click(bot, value, "Public list: On")
+    await click(bot, value, "Birthday DMs: On")
+    assert Sharing.from_record(await bot.db.birthday(1, 20)) == Sharing.all(True)
+    await click(bot, value, "Cancel")
+    assert Sharing.from_record(await bot.db.birthday(1, 20)) == Sharing.all(True)
+    await click(bot, value, "Main menu")
+    await click(bot, value, "Sharing")
+    await click(bot, value, "Public list: On")
+    await click(bot, value, "Birthday DMs: On")
+    await click(bot, value, "Save")
+    saved = await bot.db.birthday(1, 20)
+    assert Sharing.from_record(saved) == Sharing(False, True, False, True)
+    assert (
+        saved["month"],
+        saved["day"],
+        saved["timezone"],
+        saved["hour"],
+        saved["minute"],
+        saved["leap"],
+    ) == (12, 27, "Europe/London", 18, 45, "mar1")
+    await bot.menu_actions["update"](value)
+    assert bot.active_views[(1, 20)].sharing == Sharing(False, True, False, True)
+
+
+async def test_birthday_sharing_submenu_applies_to_draft_and_preserves_date_edits(menu):
+    from birthdaybot.sharing import Sharing
+
+    bot, value = menu
+    await bot.db.save(1, 20, 1, 1, "UTC", 0, 0, "feb28", True)
+    await bot.menu_actions["update"](value)
+    view = bot.active_views[(1, 20)]
+    view.month, view.day = 2, 29
+    await click(bot, value, "Sharing")
+    await click(bot, value, "Public list: On")
+    await click(bot, value, "Birthday DMs: On")
+    await click(bot, value, "Cancel")
+    assert view.sharing == Sharing.all(True)
+    assert (view.month, view.day) == (2, 29)
+    await click(bot, value, "Sharing")
+    await click(bot, value, "Server posts: On")
+    await click(bot, value, "Post mentions: On")
+    await click(bot, value, "Apply")
+    assert view.sharing == Sharing(True, False, True, False)
+    assert (await bot.db.birthday(1, 20))["month"] == 1
+    assert Sharing.from_record(await bot.db.birthday(1, 20)) == Sharing.all(True)
+    await click(bot, value, "Save")
+    assert Sharing.from_record(await bot.db.birthday(1, 20)) == Sharing(True, False, True, False)
+    assert (await bot.db.birthday(1, 20))["day"] == 29
+
+
+async def test_sharing_owner_checks_and_deleted_records_cannot_be_bypassed(menu):
+    from birthdaybot.sharing import Sharing
+
+    bot, value = menu
+    await bot.db.save(1, 20, 1, 1, "UTC", 0, 0, "feb28", True)
+    await bot.menu_actions["sharing"](value)
+    view = bot.active_views[(1, 20)]
+    value.user.id = 21
+    await next(
+        item for item in view.children if getattr(item, "label", None) == "Public list: On"
+    ).callback(value)
+    await view.save(value)
+    assert Sharing.from_record(await bot.db.birthday(1, 20)) == Sharing.all(True)
+    value.user.id = 20
+    await bot.db.forget(1, 20)
+    with pytest.raises(ValueError, match="deleted"):
+        await click(bot, value, "Save")
+    assert await bot.db.birthday(1, 20) is None
+
+
+async def test_pending_imports_can_set_preferences_before_timezone_confirmation(menu):
+    from birthdaybot.csv_import import ImportRow
+    from birthdaybot.sharing import Sharing
+
+    bot, value = menu
+    member = 111111111111111111
+    await bot.db.import_birthdays(1, 20, [ImportRow(2, member, 2, 29, None, False)])
+    value.user.id = member
+    await bot.menu_actions["sharing"](value)
+    view = bot.active_views[(1, member)]
+    for label in ("Public list: Off", "Birthday DMs: Off"):
+        await next(
+            item for item in view.children if getattr(item, "label", None) == label
+        ).callback(value)
+    await view.save(value)
+    assert Sharing.from_record(await bot.db.pending_birthday(1, member)) == Sharing(
+        True, False, True, False
+    )
+    assert not (await bot.db.directory(1))["visible"]
+    await bot.menu_actions["update"](value)
+    draft = bot.active_views[(1, member)]
+    assert draft.sharing == Sharing(True, False, True, False) and not draft.zone_valid
+    await choose(draft, value, 2, "UTC")
+    await draft.save(value)
+    assert Sharing.from_record(await bot.db.birthday(1, member)) == Sharing(
+        True, False, True, False
+    )

@@ -35,7 +35,7 @@ def test_birthday_embed_matches_reference_fields_and_uses_precise_discord_countd
     stamp = int(next_occurrence(record(), now).timestamp())
     assert fields["Countdown"].value == f"<t:{stamp}:R> (<t:{stamp}:F>)"
     assert not fields["Countdown"].inline
-    assert fields["Sharing"].value == "Public list: On\nPosts: On · DMs: On"
+    assert fields["Sharing"].value == "Public list: On\nPosts: On · Mentions: On\nDMs: On"
     assert len(card) <= 6000
 
 
@@ -44,12 +44,11 @@ def test_card_respects_optout_pause_and_pending_timezone_without_a_guessed_count
         user(), record(consent=False), settings={"enabled": False, "channel_id": None}
     )
     fields = {field.name: field.value for field in card.fields}
-    assert fields["Sharing"] == "Public list: Off\nPosts: Off · DMs: Off"
+    assert fields["Sharing"] == "Public list: Off\nPosts: Off · Mentions: Off\nDMs: Off"
     paused = birthday_embed(user(), record(), settings={"enabled": False, "channel_id": None})
-    assert (
-        "Posts: Paused · DMs: Paused"
-        in {field.name: field.value for field in paused.fields}["Sharing"]
-    )
+    assert {field.name: field.value for field in paused.fields}[
+        "Sharing"
+    ] == "Public list: On\nPosts: Paused · Mentions: Off\nDMs: Paused"
     pending = birthday_embed(user(), record(timezone=None), draft=True, zone_valid=False)
     fields = {field.name: field.value for field in pending.fields}
     assert fields["Time Zone"] == "Required"

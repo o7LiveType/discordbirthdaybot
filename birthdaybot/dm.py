@@ -42,7 +42,7 @@ class BirthdayDMs:
                 settings = await self.db.guild(snapshot["guild_id"])
                 target = (
                     due(record, now)
-                    if record and record["consent"] and settings["enabled"]
+                    if record and record["dm_enabled"] and settings["enabled"]
                     else None
                 )
                 if target is not None:
@@ -71,7 +71,7 @@ class BirthdayDMs:
                 guild = self.bot.get_guild(job["guild_id"])
                 record = await self.db.birthday(job["guild_id"], job["user_id"])
                 current = datetime.now(UTC) if self.bot.live_clock else now
-                if not guild or not record or not record["consent"]:
+                if not guild or not record or not record["dm_enabled"]:
                     await self.db.dm_state(
                         job, "skipped", error="No eligible birthday at delivery time"
                     )
